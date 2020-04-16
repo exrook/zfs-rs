@@ -4,6 +4,8 @@ use std::os::unix::fs::FileExt;
 use std::convert::TryInto;
 use std::fmt;
 
+use nom::{IResult, number::complete as number};
+
 pub struct Device {
     file: File
 }
@@ -45,21 +47,20 @@ impl fmt::Debug for DVA {
 impl DVA {
     pub fn from_raw(bytes: &[u8]) -> Self {
         assert!(bytes.len() == 16);
-        let mut asize_bytes: [u8; 4] = bytes[0..4].try_into().unwrap();
-        asize_bytes[3] = 0;
-        let asize = u32::from_le_bytes(asize_bytes);
-        let grid = bytes[3];
-        let vdev = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let mut offset = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-        let gang = (offset & 1<<63) != 0;
-        offset &= !(1u64<<63);
-        Self {
+        Self::parse(bytes).unwrap().1
+    }
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        use nom::{bits, tuple, take_bits};
+        let (input, (asize, grid, vdev)) = nom::sequence::tuple((number::le_u24, number::le_u8, number::le_u32))(input)?;
+        let (input, (offset, gang)): (_,(u64, u8)) = bits!(input, tuple!(take_bits!(63usize), take_bits!(1usize)))?;
+        let gang = if gang == 0 { false } else { true };
+        Ok((input, Self {
             vdev,
             grid,
             asize,
             offset,
             gang
-        }
+        }))
     }
 }
 
@@ -85,32 +86,40 @@ pub struct BlockPtr {
 impl BlockPtr {
     pub fn from_raw(bytes: &[u8]) -> Self {
         assert!(bytes.len() == 128);
-        Self {
-            addresses: [
-                DVA::from_raw(&bytes[0..16]),
-                DVA::from_raw(&bytes[16..32]),
-                DVA::from_raw(&bytes[32..48])
-            ],
-            logical_size: u16::from_le_bytes(bytes[48..50].try_into().unwrap()),
-            physical_size: u16::from_le_bytes(bytes[50..52].try_into().unwrap()),
-            compression_type: bytes[52] & !(1u8<<7),
-            embedded_data: (bytes[52] & (1u8<<7)) != 0,
-            checksum_type: bytes[53],
-            kind: bytes[54],
-            indirection_level: bytes[55] & 31,
-            encryption: (bytes[55] & (1u8<<5)) != 0,
-            dedup: (bytes[55] & (1u8<<6)) != 0,
-            byteorder: (bytes[55] & (1u8<<7)) != 0,
-            physical_transaction: u64::from_le_bytes(bytes[72..80].try_into().unwrap()),
-            logical_transaction: u64::from_le_bytes(bytes[80..88].try_into().unwrap()),
-            fill_count: u64::from_le_bytes(bytes[88..96].try_into().unwrap()),
-            checksum: [
-                u64::from_le_bytes(bytes[96..104].try_into().unwrap()),
-                u64::from_le_bytes(bytes[104..112].try_into().unwrap()),
-                u64::from_le_bytes(bytes[112..120].try_into().unwrap()),
-                u64::from_le_bytes(bytes[120..128].try_into().unwrap())
-            ]
-        }
+        Self::parse(bytes).unwrap().1
+    }
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        use nom::{bits, tuple, take_bits};
+        let (input, (a1, a2, a3)) = nom::sequence::tuple((DVA::parse, DVA::parse, DVA::parse))(input)?;
+        let addresses = [a1, a2, a3];
+        let (input, (logical_size, physical_size)) = nom::sequence::tuple((number::le_u16, number::le_u16))(input)?;
+        let (input, (compression_type, embedded_data)): (_,(_, u8)) = bits!(input, tuple!(take_bits!(7usize), take_bits!(1usize)))?;
+        let embedded_data = embedded_data != 0;
+        let (input, (checksum_type, kind)) = nom::sequence::tuple((number::le_u8, number::le_u8))(input)?;
+        let (input, (indirection_level, encryption, dedup, byteorder)): (_, (_, u8, u8, u8)) = bits!(input, tuple!(take_bits!(5usize), take_bits!(1usize), take_bits!(1usize), take_bits!(1usize)))?;
+        let encryption = encryption != 0;
+        let dedup = dedup != 0;
+        let byteorder = byteorder != 0;
+        let (input, (_pad, physical_transaction, logical_transaction, fill_count)) =  nom::sequence::tuple((nom::bytes::complete::take(16usize), number::le_u64, number::le_u64, number::le_u64))(input)?;
+        let (input, (c1, c2, c3, c4)) = nom::sequence::tuple((number::le_u64, number::le_u64, number::le_u64, number::le_u64))(input)?;
+        let checksum = [c1, c2, c3 ,c4];
+        Ok((input, Self {
+            addresses,
+            logical_size,
+            physical_size,
+            compression_type,
+            embedded_data,
+            checksum_type,
+            kind,
+            indirection_level,
+            encryption,
+            dedup,
+            byteorder,
+            physical_transaction,
+            logical_transaction,
+            fill_count,
+            checksum
+        }))
     }
 }
 
@@ -132,18 +141,46 @@ pub struct DNodePhysHeader {
 impl DNodePhysHeader {
     pub fn from_raw(bytes: &[u8]) -> Self {
         assert!(bytes.len() == 64);
-        Self {
-            kind: bytes[0],
-            indirect_block_shift: bytes[1],
-            levels: bytes[2],
-            num_block_ptr: bytes[3],
-            bonus_type: bytes[4],
-            checksum: bytes[5],
-            compress: bytes[6],
-            datablkszsec: u16::from_le_bytes(bytes[8..10].try_into().unwrap()),
-            bonus_len: u16::from_le_bytes(bytes[10..12].try_into().unwrap()),
-            max_block_id: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            sec_phys: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-        }
+        Self::parse(bytes).unwrap().1
+    }
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (kind, indirect_block_shift, levels, num_block_ptr, bonus_type, checksum, compress)) = nom::sequence::tuple((number::le_u8,number::le_u8,number::le_u8,number::le_u8,number::le_u8,number::le_u8, number::le_u8))(input)?;
+        let (input, _pad) = nom::bytes::complete::take(1usize)(input)?;
+        let (input, (datablkszsec, bonus_len)) = nom::sequence::tuple((number::le_u16, number::le_u16))(input)?;
+        let (input, _pad) = nom::bytes::complete::take(4usize)(input)?;
+        let (input, (max_block_id, sec_phys)) = nom::sequence::tuple((number::le_u64, number::le_u64))(input)?;
+        Ok((input, Self {
+            kind,
+            indirect_block_shift,
+            levels,
+            num_block_ptr,
+            bonus_type,
+            checksum,
+            compress,
+            datablkszsec,
+            bonus_len,
+            max_block_id,
+            sec_phys
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub struct DNodePhys {
+    header: DNodePhysHeader,
+    block_pointers: Vec<BlockPtr>,
+    bonus: Vec<u8>
+}
+
+impl DNodePhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, header) = DNodePhysHeader::parse(input)?;
+        let (input, block_pointers) = nom::multi::count(BlockPtr::parse, header.num_block_ptr as usize)(input)?;
+        let (input, bonus) = nom::bytes::complete::take(header.bonus_len as usize)(input)?;
+        Ok((input, Self {
+            header,
+            block_pointers,
+            bonus: bonus.to_vec()
+        }))
     }
 }
