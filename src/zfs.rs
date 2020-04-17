@@ -1,10 +1,12 @@
 use std::fs::File;
 use std::path::Path;
 use std::os::unix::fs::FileExt;
-use std::convert::TryInto;
+use std::convert::TryFrom;
 use std::fmt;
 
 use nom::{IResult, number::complete as number};
+
+use enum_repr_derive::TryFrom;
 
 pub struct Device {
     file: File
@@ -174,13 +176,160 @@ pub struct DNodePhys {
 
 impl DNodePhys {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
-        let (input, header) = DNodePhysHeader::parse(input)?;
-        let (input, block_pointers) = nom::multi::count(BlockPtr::parse, header.num_block_ptr as usize)(input)?;
-        let (input, bonus) = nom::bytes::complete::take(header.bonus_len as usize)(input)?;
+        nom::combinator::map_parser(nom::bytes::complete::take(512usize), |input| {
+            let (input, header) = DNodePhysHeader::parse(input)?;
+            let (input, block_pointers) = nom::multi::count(BlockPtr::parse, header.num_block_ptr as usize)(input)?;
+            let (input, bonus) = nom::bytes::complete::take(header.bonus_len as usize)(input)?;
+            Ok((input, Self {
+                header,
+                block_pointers,
+                bonus: bonus.to_vec()
+            }))
+        })(input)
+    }
+}
+
+#[derive(Debug)]
+pub struct ObjsetPhys {
+    metadnode: DNodePhys,
+    os_zil_header: ZilHeader,
+    os_type: OsType
+}
+
+impl ObjsetPhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (metadnode, os_zil_header, os_type)) = nom::combinator::map_parser(nom::bytes::complete::take(1024usize), nom::sequence::tuple((DNodePhys::parse, ZilHeader::parse, OsType::parse)))(input)?;
         Ok((input, Self {
-            header,
-            block_pointers,
-            bonus: bonus.to_vec()
+            metadnode,
+            os_zil_header,
+            os_type
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZilHeader {
+    claim_txg: u64,
+    replay_seq: u64,
+    log: BlockPtr
+}
+
+impl ZilHeader {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (claim_txg, replay_seq, log)) = nom::sequence::tuple((number::le_u64, number::le_u64, BlockPtr::parse))(input)?;
+        Ok((input, Self {
+            claim_txg,
+            replay_seq,
+            log
+        }))
+    }
+}
+
+#[derive(Debug, TryFrom)]
+#[repr(u64)]
+pub enum OsType {
+    NONE = 0,
+    META = 1,
+    ZFS = 2,
+    ZVOL = 3
+}
+
+impl OsType {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        nom::combinator::map_res(number::le_u64, |x| OsType::try_from(x))(input)
+    }
+}
+
+#[derive(Debug)]
+pub struct DatasetPhys {
+    dir_obj: u64,
+    prev_snap_obj: u64,
+    prev_snap_obj_transaction: u64,
+    next_snap_obj: u64,
+    snapnames_zapobj: u64,
+    num_children: u64,
+    creation_time: u64,
+    creation_txg: u64,
+    deadlist_obj: u64,
+    referenced_bytes: u64,
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
+    unique_bytes: u64,
+    fsid_guid: u64,
+    guid: u64,
+    flags: u64,
+    bp: BlockPtr,
+    next_clones_obj: u64,
+    props_obj: u64,
+    userrefs_obj: u64,
+}
+
+impl DatasetPhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (dir_obj, prev_snap_obj, prev_snap_obj_transaction, next_snap_obj, snapnames_zapobj, num_children, creation_time, creation_txg, deadlist_obj, referenced_bytes, compressed_bytes, uncompressed_bytes, unique_bytes, fsid_guid, guid, flags, bp, next_clones_obj, props_obj, userrefs_obj)) =  nom::combinator::map_parser(nom::bytes::complete::take(320usize), nom::sequence::tuple((number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, BlockPtr::parse, number::le_u64, number::le_u64, number::le_u64)))(input)?;
+        Ok((input, Self {
+            dir_obj,
+            prev_snap_obj,
+            prev_snap_obj_transaction,
+            next_snap_obj,
+            snapnames_zapobj,
+            num_children,
+            creation_time,
+            creation_txg,
+            deadlist_obj,
+            referenced_bytes,
+            compressed_bytes,
+            uncompressed_bytes,
+            unique_bytes,
+            fsid_guid,
+            guid,
+            flags,
+            bp,
+            next_clones_obj,
+            props_obj,
+            userrefs_obj,
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub struct DirPhys {
+    creation_time: u64,
+    head_dataset_obj: u64,
+    parent_obj: u64,
+    clone_parent_obj: u64,
+    clone_dir_zapobj: u64,
+    used_bytes: u64,
+    compressed_bytes: u64,
+    uncompressed_bytes: u64,
+    quota: u64,
+    reserved: u64,
+    props_zapobj: u64,
+    deleg_zapobj: u64,
+    flags: u64,
+    used_breakdown: [u64; 5],
+    clones: u64
+}
+
+impl DirPhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (creation_time, head_dataset_obj, parent_obj, clone_parent_obj, clone_dir_zapobj, used_bytes, compressed_bytes, uncompressed_bytes, quota, reserved, props_zapobj, deleg_zapobj, flags, b1, b2, b3, b4, b5, clones)) = nom::combinator::map_parser(nom::bytes::complete::take(320usize), nom::sequence::tuple((number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64, number::le_u64)))(input)?;
+        Ok((input, Self {
+            creation_time,
+            head_dataset_obj,
+            parent_obj,
+            clone_parent_obj,
+            clone_dir_zapobj,
+            used_bytes,
+            compressed_bytes,
+            uncompressed_bytes,
+            quota,
+            reserved,
+            props_zapobj,
+            deleg_zapobj,
+            flags,
+            used_breakdown: [b1, b2, b3, b4, b5],
+            clones
         }))
     }
 }
