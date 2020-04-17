@@ -3,14 +3,14 @@
 #[macro_use]
 extern crate rocket;
 
+use std::convert::TryInto;
 use std::env::args_os;
 use std::fmt::Write;
 use std::num::ParseIntError;
-use std::convert::TryInto;
 
-use rocket::{State, Request, Outcome};
+use rocket::http::{RawStr, Status};
 use rocket::request::FromParam;
-use rocket::http::{Status,RawStr};
+use rocket::{Outcome, Request, State};
 
 mod zfs;
 
@@ -19,7 +19,10 @@ use zfs::Device;
 fn main() {
     println!("Hello, world!");
     let dev = Device::new(args_os().nth(1).expect("An argument is required"));
-    rocket::ignite().manage(dev).mount("/", routes![block_compressed, block]).launch();
+    rocket::ignite()
+        .manage(dev)
+        .mount("/", routes![block_compressed, block])
+        .launch();
 }
 
 struct NumFromHex(pub u64);
@@ -32,20 +35,24 @@ impl<'a> FromParam<'a> for NumFromHex {
 }
 
 #[get("/block/<vdev>/<id>/<asize>?<view>")]
-fn block(dev: State<Device>, vdev: u32, id: NumFromHex, asize: u32, view: Option<String>) -> String {
+fn block(
+    dev: State<Device>,
+    vdev: u32,
+    id: NumFromHex,
+    asize: u32,
+    view: Option<String>,
+) -> String {
     let address = id.0 + 0x400000;
     let mut output = String::new();
     match view.as_deref() {
-        None => {
-
-        }
+        None => {}
         Some("d") => {
             let data = dev.read(address, 64);
             let address = address + 64;
             let dnode = zfs::DNodePhysHeader::from_raw(&data);
             writeln!(output, "{:#?}", dnode);
             for i in (0..dnode.num_block_ptr as u64) {
-                let data = dev.read(address + i*128, 128);
+                let data = dev.read(address + i * 128, 128);
                 let blockptr = zfs::BlockPtr::from_raw(&data);
                 writeln!(output, "{:#?}", blockptr);
             }
@@ -60,7 +67,15 @@ fn block(dev: State<Device>, vdev: u32, id: NumFromHex, asize: u32, view: Option
     output
 }
 #[get("/block/<vdev>/<id>/<asize>?<view>&compress&<phys_size>&<logical_size>")]
-fn block_compressed(dev: State<Device>, vdev: u32, id: NumFromHex, asize: u32, view: Option<String>, phys_size: u32, logical_size: u32) -> String {
+fn block_compressed(
+    dev: State<Device>,
+    vdev: u32,
+    id: NumFromHex,
+    asize: u32,
+    view: Option<String>,
+    phys_size: u32,
+    logical_size: u32,
+) -> String {
     let address = id.0 + 0x400000;
     let compressed_data = dev.read(address, phys_size as u64 * 512);
     let size = u32::from_be_bytes(compressed_data[0..4].try_into().unwrap());
@@ -69,14 +84,12 @@ fn block_compressed(dev: State<Device>, vdev: u32, id: NumFromHex, asize: u32, v
     let data = lz4_compression::decompress::decompress(&compressed_data).unwrap();
     let mut output = String::new();
     match view.as_deref() {
-        None => {
-
-        }
+        None => {}
         Some("d") => {
             let dnode = zfs::DNodePhysHeader::from_raw(&data[0..64]);
             writeln!(output, "{:#?}", dnode);
             for i in (0..dnode.num_block_ptr as usize) {
-                let blockptr = zfs::BlockPtr::from_raw(&data[(64 + i*128)..(64 + 128 + i*128)]);
+                let blockptr = zfs::BlockPtr::from_raw(&data[(64 + i * 128)..(64 + 128 + i * 128)]);
                 writeln!(output, "{:#?}", blockptr);
             }
             if dnode.bonus_len > 0 {
