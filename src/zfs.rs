@@ -492,3 +492,357 @@ impl DirPhys {
         ))
     }
 }
+
+const ZBT_MICRO: u64 = (1 << 63) + 3;
+const ZBT_HEADER: u64 = (1 << 63) + 1;
+const ZBT_LEAF: u64 = (1 << 63) + 0;
+
+#[derive(Debug)]
+pub struct MZapPhys {
+    block_type: u64,
+    salt: u64,
+    entries: Vec<MZapEntryPhys>,
+}
+
+impl MZapPhys {
+    pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
+        let (input, (block_type, salt, _pad, entries)) = nom::combinator::map_parser(
+            nom::bytes::complete::take(block_size),
+            nom::sequence::tuple((
+                nom::combinator::verify(number::le_u64, |btype| *btype == ZBT_MICRO),
+                number::le_u64,
+                nom::bytes::complete::take(48usize),
+                nom::multi::many1(MZapEntryPhys::parse),
+            )),
+        )(input)?;
+        Ok((
+            input,
+            Self {
+                block_type,
+                salt,
+                entries,
+            },
+        ))
+    }
+}
+
+pub struct MZapEntryPhys {
+    value: u64,
+    cd: u32,
+    //name: [u8; 50],
+    name: Vec<u8>,
+}
+
+impl MZapEntryPhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (value, cd, name)) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u32,
+            nom::bytes::complete::take(50usize),
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                value,
+                cd,
+                name: name.to_vec(),
+            },
+        ))
+    }
+}
+
+impl fmt::Debug for MZapEntryPhys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MZapEntryPhys")
+            .field("value", &self.value)
+            .field("cd", &self.cd)
+            .field("name", &&self.name[..])
+            .finish()
+    }
+}
+
+pub struct ZapPhys {
+    block_type: u64,
+    magic: u64,
+    ptrtbl: ZapTablePhys,
+    freeblk: u64,
+    num_leafs: u64,
+    num_entries: u64,
+    salt: u64,
+    //leafs: [u64; 8192],
+    leafs: Vec<u64>,
+}
+
+impl fmt::Debug for ZapPhys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZapPhys")
+            .field("block_type", &self.block_type)
+            .field("magic", &self.magic)
+            .field("ptrtbl", &self.ptrtbl)
+            .field("freeblk", &self.freeblk)
+            .field("num_leafs", &self.num_leafs)
+            .field("num_entries", &self.num_entries)
+            .field("salt", &self.salt)
+            .field("leafs", &&self.leafs[..])
+            .finish()
+    }
+}
+
+impl ZapPhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (
+            input,
+            (block_type, magic, ptrtbl, freeblk, num_leafs, num_entries, salt, _pad, leafs),
+        ) = nom::sequence::tuple((
+            nom::combinator::verify(number::le_u64, |btype| *btype == ZBT_HEADER),
+            number::le_u64,
+            ZapTablePhys::parse,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            nom::bytes::complete::take(8181 * 8usize),
+            nom::multi::count(number::le_u64, 8192),
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                block_type,
+                magic,
+                ptrtbl,
+                freeblk,
+                num_leafs,
+                num_entries,
+                salt,
+                leafs,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZapTablePhys {
+    blk: u64, // pointer to first block of pointer table, block ID pointer
+    numblks: u64,
+    shift: u64,
+    nextblk: u64,
+    blk_copied: u64,
+}
+
+impl ZapTablePhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (blk, numblks, shift, nextblk, blk_copied)) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                blk,
+                numblks,
+                shift,
+                nextblk,
+                blk_copied,
+            },
+        ))
+    }
+}
+
+//const ZAP_LEAF_HASH_NUMENTRIES: usize = 4096;
+//const ZAP_LEAF_NUMCHUNKS: usize = 0; // TODO find correct value
+const ZAP_LEAF_ARRAY_BYTES: usize = 24 - 3;
+
+const fn ZAP_LEAF_HASH_NUMENTRIES(block_size: usize) -> usize {
+    block_size / 32
+}
+
+const fn ZAP_LEAF_NUMCHUNKS(block_size: usize) -> usize {
+    (block_size - (2 * ZAP_LEAF_HASH_NUMENTRIES(block_size)) / 24) - 2
+}
+
+#[derive(Debug)]
+pub struct ZapLeafPhys {
+    hdr: ZapLeafHeader,
+    //hash: [u16; ZAP_LEAF_HASH_NUMENTRIES],
+    hash: Vec<u16>,
+    //chunks: [ZapLeafChunk; ZAP_LEAF_NUMCHUNKS]
+    chunks: Vec<ZapLeafChunk>,
+}
+
+impl ZapLeafPhys {
+    pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
+        let (input, (hdr, hash, chunks)) = nom::sequence::tuple((
+            ZapLeafHeader::parse,
+            nom::multi::count(number::le_u16, ZAP_LEAF_HASH_NUMENTRIES(block_size)),
+            nom::multi::count(ZapLeafChunk::parse, ZAP_LEAF_NUMCHUNKS(block_size)),
+        ))(input)?;
+        Ok((input, Self { hdr, hash, chunks }))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZapLeafHeader {
+    block_type: u64,
+    next: u64,
+    prefix: u64,
+    magic: u32,
+    nfree: u16,
+    nentries: u16,
+    prefix_len: u16,
+    freelist: u16,
+    flags: u8,
+}
+
+impl ZapLeafHeader {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (
+            input,
+            (block_type, next, prefix, magic, nfree, nentries, prefix_len, freelist, flags, _pad),
+        ) = nom::sequence::tuple((
+            nom::combinator::verify(number::le_u64, |btype| *btype == ZBT_LEAF),
+            number::le_u64,
+            number::le_u64,
+            number::le_u32,
+            number::le_u16,
+            number::le_u16,
+            number::le_u16,
+            number::le_u16,
+            number::le_u8,
+            nom::bytes::complete::take(11usize),
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                block_type,
+                next,
+                prefix,
+                magic,
+                nfree,
+                nentries,
+                prefix_len,
+                freelist,
+                flags,
+            },
+        ))
+    }
+}
+
+const ZAP_LEAF_ENTRY: u8 = 252;
+const ZAP_LEAF_ARRAY: u8 = 251;
+const ZAP_LEAF_FREE: u8 = 253;
+
+#[derive(Debug)]
+pub enum ZapLeafChunk {
+    Entry(ZapLeafEntry),
+    Array(ZapLeafArray),
+    Free(ZapLeafFree),
+}
+
+impl ZapLeafChunk {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        nom::branch::alt((ZapLeafEntry::parse, ZapLeafArray::parse, ZapLeafFree::parse))(input)
+    }
+}
+
+#[derive(Debug)]
+pub struct ZapLeafEntry {
+    kind: u8,
+    int_size: u8,
+    next: u16,
+    name_chunk: u16,
+    name_length: u16,
+    value_chunk: u16,
+    value_length: u16,
+    cd: u16,
+    hash: u64,
+}
+
+impl ZapLeafEntry {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], ZapLeafChunk> {
+        let (
+            input,
+            (
+                kind,
+                int_size,
+                next,
+                name_chunk,
+                name_length,
+                value_chunk,
+                value_length,
+                cd,
+                _pad,
+                hash,
+            ),
+        ) = nom::sequence::tuple((
+            nom::combinator::verify(number::le_u8, |kind| *kind == ZAP_LEAF_ENTRY),
+            number::le_u8,
+            number::le_u16,
+            number::le_u16,
+            number::le_u16,
+            number::le_u16,
+            number::le_u16,
+            number::le_u16,
+            nom::bytes::complete::take(2usize),
+            number::le_u64,
+        ))(input)?;
+        Ok((
+            input,
+            ZapLeafChunk::Entry(Self {
+                kind,
+                int_size,
+                next,
+                name_chunk,
+                name_length,
+                value_chunk,
+                value_length,
+                cd,
+                hash,
+            }),
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZapLeafArray {
+    kind: u8,
+    array: [u8; ZAP_LEAF_ARRAY_BYTES],
+    next: u16,
+}
+
+impl ZapLeafArray {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], ZapLeafChunk> {
+        let (input, (kind, array, next)) = nom::sequence::tuple((
+            nom::combinator::verify(number::le_u8, |kind| *kind == ZAP_LEAF_ARRAY),
+            nom::bytes::complete::take(ZAP_LEAF_ARRAY_BYTES),
+            number::le_u16,
+        ))(input)?;
+        Ok((
+            input,
+            ZapLeafChunk::Array(Self {
+                kind,
+                array: TryFrom::try_from(array).unwrap(),
+                next,
+            }),
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZapLeafFree {
+    kind: u8,
+    next: u16,
+}
+
+impl ZapLeafFree {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], ZapLeafChunk> {
+        let (input, (kind, _pad, next)) = nom::sequence::tuple((
+            nom::combinator::verify(number::le_u8, |kind| *kind == ZAP_LEAF_FREE),
+            nom::bytes::complete::take(ZAP_LEAF_ARRAY_BYTES),
+            number::le_u16,
+        ))(input)?;
+        Ok((input, ZapLeafChunk::Free(Self { kind, next })))
+    }
+}
