@@ -8,6 +8,8 @@ use nom::{number::complete as number, IResult};
 
 use enum_repr_derive::TryFrom;
 
+use crate::fletcher::{Fletcher2, Fletcher4};
+
 pub struct Device {
     file: File,
 }
@@ -72,6 +74,22 @@ impl DVA {
 #[derive(Debug)]
 pub struct Checksum {
     checksum: [u64; 4],
+}
+
+impl From<Fletcher4> for Checksum {
+    fn from(f: Fletcher4) -> Self {
+        Self {
+            checksum: [f.a, f.b, f.c, f.d],
+        }
+    }
+}
+
+impl From<Fletcher2> for Checksum {
+    fn from(f: Fletcher2) -> Self {
+        Self {
+            checksum: [f.a0, f.a1, f.b0, f.b1],
+        }
+    }
 }
 
 impl Checksum {

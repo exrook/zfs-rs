@@ -12,6 +12,8 @@ use rocket::http::{RawStr, Status};
 use rocket::request::FromParam;
 use rocket::{Outcome, Request, State};
 
+mod compression;
+mod fletcher;
 mod zfs;
 
 use zfs::Device;
