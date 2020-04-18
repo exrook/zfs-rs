@@ -1,6 +1,8 @@
 use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::fs::File;
+use std::io::Error as IoError;
+use std::io::Result as IoResult;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -8,24 +10,144 @@ use nom::{number::complete as number, IResult};
 
 use enum_repr_derive::TryFrom;
 
+use crate::compression::decompress_lz4;
 use crate::fletcher::{Fletcher2, Fletcher4};
 
-pub struct Device {
+pub struct Disk {
     file: File,
 }
 
-impl Device {
+impl Disk {
     pub fn new<P: AsRef<Path>>(path: P) -> Self {
         let f = File::open(path).unwrap();
         Self { file: f }
     }
-    pub fn read(&self, address: u64, len: u64) -> Vec<u8> {
+    pub fn read(&self, address: u64, len: u64) -> IoResult<Vec<u8>> {
         let mut buf = vec![0; len as usize];
-        self.file.read_exact_at(&mut buf, address);
-        buf
+        self.file.read_exact_at(&mut buf, address)?;
+        Ok(buf)
     }
 }
 
+trait RawDevice {
+    type Block: AsRef<[u8]>;
+    /// Read the requested amount, given in bytes
+    fn read_raw(&self, addr: u64, size: u64) -> IoResult<Self::Block>;
+}
+
+impl RawDevice for Disk {
+    type Block = Vec<u8>;
+    fn read_raw(&self, addr: u64, size: u64) -> IoResult<Self::Block> {
+        self.read(addr, size)
+    }
+}
+
+enum ZfsError {
+    Checksum,
+    Parse(nom::error::ErrorKind),
+    UnsupportedFeature,
+    Io(IoError),
+}
+
+impl From<IoError> for ZfsError {
+    fn from(e: IoError) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl<T> From<nom::Err<(T, nom::error::ErrorKind)>> for ZfsError {
+    fn from(e: nom::Err<(T, nom::error::ErrorKind)>) -> Self {
+        Self::Parse(match e {
+            nom::Err::Incomplete(_) => nom::error::ErrorKind::Complete,
+            nom::Err::Error(e) => e.1,
+            nom::Err::Failure(f) => f.1,
+        })
+    }
+}
+
+// TODO: better name
+enum RawOrNah<B> {
+    Raw(B),
+    Nah(Vec<u8>),
+}
+
+trait Device {
+    type Block: AsRef<[u8]>;
+    fn get(&self, ptr: BlockPtr) -> Result<RawOrNah<Self::Block>, ZfsError> {
+        if ptr.encryption || ptr.embedded_data || ptr.compression_type != CompressionType::LZ4 {
+            return Err(ZfsError::UnsupportedFeature);
+        }
+        let r: Result<Vec<ZfsError>, RawOrNah<Self::Block>> = ptr
+            .addresses
+            .iter()
+            .map(|dva| {
+                let block = self.read(ptr.addresses[0])?;
+                // check checksums
+                match ptr.checksum_type {
+                    ChecksumType::ZILog | ChecksumType::Fletcher2 => {
+                        // fletcher2
+                        let (_input, cksum) = Fletcher2::parse(block.as_ref())?;
+                        if ptr.checksum == cksum.into() {
+                            Ok(())
+                        } else {
+                            Err(ZfsError::Checksum)
+                        }
+                    }
+                    ChecksumType::On | ChecksumType::Fletcher4 => {
+                        // fletcher4
+                        let (_input, cksum) = Fletcher4::parse(block.as_ref())?;
+                        if ptr.checksum == cksum.into() {
+                            Ok(())
+                        } else {
+                            Err(ZfsError::Checksum)
+                        }
+                    }
+                    ChecksumType::Label | ChecksumType::GangHeader | ChecksumType::SHA256 => {
+                        // SHA256
+                        Err(ZfsError::UnsupportedFeature)
+                    }
+                    ChecksumType::Off => Ok(()), // do nothing
+                    _ => {
+                        // unsupported
+                        Err(ZfsError::UnsupportedFeature)
+                    }
+                }?;
+                // decompress
+                Ok(match ptr.compression_type {
+                    CompressionType::Off => RawOrNah::Raw(block),
+                    CompressionType::LZ4 => RawOrNah::Nah(decompress_lz4(block.as_ref())?.1),
+                    _ => Err(ZfsError::UnsupportedFeature)?,
+                })
+            })
+            .map(|r| match r {
+                Ok(o) => Err(o),
+                Err(e) => Ok(e),
+            })
+            .collect();
+        match r.map(|mut v| v.pop().unwrap()) {
+            Ok(e) => Err(e),
+            Err(o) => Ok(o),
+        }
+    }
+    fn read(&self, addr: DVA) -> Result<Self::Block, ZfsError>;
+}
+
+impl<T, B: AsRef<[u8]>> Device for T
+where
+    T: RawDevice<Block = B>,
+{
+    type Block = B;
+    fn read(&self, addr: DVA) -> Result<Self::Block, ZfsError> {
+        if addr.gang {
+            return Err(ZfsError::UnsupportedFeature);
+        }
+        // offset is stored in units of 512, byte read_raw takes units of bytes
+        // this could overflow offset, but I don't have any 2^55 byte drives to test on
+        Ok(self.read_raw(addr.offset << 9 + 0x400000, (addr.asize as u64) << 9)?)
+    }
+}
+
+#[derive(Copy, Clone)]
 pub struct DVA {
     vdev: u32,
     grid: u8,
@@ -71,7 +193,7 @@ impl DVA {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Checksum {
     checksum: [u64; 4],
 }
@@ -109,6 +231,57 @@ impl Checksum {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, TryFrom, Eq, PartialEq)]
+enum CompressionType {
+    Inherit = 0,
+    On = 1,
+    Off = 2,
+    LZJB = 3,
+    Empty = 4,
+    GZIP1 = 5,
+    GZIP2 = 6,
+    GZIP3 = 7,
+    GZIP4 = 8,
+    GZIP5 = 9,
+    GZIP6 = 10,
+    GZIP7 = 11,
+    GZIP8 = 12,
+    GZIP9 = 13,
+    ZLE = 14,
+    LZ4 = 15,
+}
+
+impl CompressionType {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        nom::combinator::map_res(number::le_u8, |x| Self::try_from(x))(input)
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, TryFrom, Eq, PartialEq)]
+enum ChecksumType {
+    Inherit = 0,
+    On = 1,
+    Off = 2,
+    Label = 3,
+    GangHeader = 4,
+    ZILog = 5,
+    Fletcher2 = 6,
+    Fletcher4 = 7,
+    SHA256 = 8,
+    ZILog2 = 9,
+    NoParity = 10,
+    SHA512 = 11,
+    Skein = 12,
+}
+
+impl ChecksumType {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        nom::combinator::map_res(number::le_u8, |x| Self::try_from(x))(input)
+    }
+}
+
 #[derive(Debug)]
 pub struct BlockPtr {
     addresses: [DVA; 3],
@@ -117,8 +290,8 @@ pub struct BlockPtr {
     encryption: bool,
     indirection_level: u8,
     kind: u8,
-    checksum_type: u8,
-    compression_type: u8,
+    checksum_type: ChecksumType,
+    compression_type: CompressionType,
     embedded_data: bool,
     physical_size: u16,
     logical_size: u16,
@@ -134,17 +307,22 @@ impl BlockPtr {
         Self::parse(bytes).unwrap().1
     }
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
-        use nom::{bits, take_bits, tuple};
+        use nom::{bits, map_res, take_bits, tuple};
         let (input, (a1, a2, a3)) =
             nom::sequence::tuple((DVA::parse, DVA::parse, DVA::parse))(input)?;
         let addresses = [a1, a2, a3];
         let (input, (logical_size, physical_size)) =
             nom::sequence::tuple((number::le_u16, number::le_u16))(input)?;
-        let (input, (compression_type, embedded_data)): (_, (_, u8)) =
-            bits!(input, tuple!(take_bits!(7usize), take_bits!(1usize)))?;
+        let (input, (compression_type, embedded_data)): (_, (_, u8)) = bits!(
+            input,
+            tuple!(
+                map_res!(take_bits!(7usize), TryFrom::<u8>::try_from),
+                take_bits!(1usize)
+            )
+        )?;
         let embedded_data = embedded_data != 0;
         let (input, (checksum_type, kind)) =
-            nom::sequence::tuple((number::le_u8, number::le_u8))(input)?;
+            nom::sequence::tuple((ChecksumType::parse, number::le_u8))(input)?;
         let (input, (indirection_level, encryption, dedup, byteorder)): (_, (_, u8, u8, u8)) = bits!(
             input,
             tuple!(
