@@ -1,4 +1,4 @@
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -70,6 +70,28 @@ impl DVA {
 }
 
 #[derive(Debug)]
+pub struct Checksum {
+    checksum: [u64; 4],
+}
+
+impl Checksum {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (c1, c2, c3, c4)) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                checksum: [c1, c2, c3, c4],
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
 pub struct BlockPtr {
     addresses: [DVA; 3],
     byteorder: bool,
@@ -85,7 +107,7 @@ pub struct BlockPtr {
     physical_transaction: u64,
     logical_transaction: u64,
     fill_count: u64,
-    checksum: [u64; 4],
+    checksum: Checksum,
 }
 
 impl BlockPtr {
@@ -124,13 +146,7 @@ impl BlockPtr {
                 number::le_u64,
                 number::le_u64,
             ))(input)?;
-        let (input, (c1, c2, c3, c4)) = nom::sequence::tuple((
-            number::le_u64,
-            number::le_u64,
-            number::le_u64,
-            number::le_u64,
-        ))(input)?;
-        let checksum = [c1, c2, c3, c4];
+        let (input, checksum) = Checksum::parse(input)?;
         Ok((
             input,
             Self {
@@ -151,6 +167,45 @@ impl BlockPtr {
                 checksum,
             },
         ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZioGbh {
+    blkptr: [BlockPtr; 3],
+    tail: ZioBlockTail,
+}
+
+impl ZioGbh {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (b0, b1, b2, _pad, tail)) = nom::sequence::tuple((
+            BlockPtr::parse,
+            BlockPtr::parse,
+            BlockPtr::parse,
+            nom::bytes::complete::take(512usize - (128 * 3) - (5 * 8)),
+            ZioBlockTail::parse,
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                blkptr: [b0, b1, b2],
+                tail,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZioBlockTail {
+    magic: u64,
+    checksum: Checksum,
+}
+
+impl ZioBlockTail {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (magic, checksum)) =
+            nom::sequence::tuple((number::le_u64, Checksum::parse))(input)?;
+        Ok((input, Self { magic, checksum }))
     }
 }
 
@@ -844,5 +899,201 @@ impl ZapLeafFree {
             number::le_u16,
         ))(input)?;
         Ok((input, ZapLeafChunk::Free(Self { kind, next })))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZNodePhys {
+    atime: [u64; 2],
+    mtime: [u64; 2],
+    ctime: [u64; 2],
+    crtime: [u64; 2],
+    gen: u64,
+    mode: u64,
+    parent: u64,
+    links: u64,
+    xattr: u64,
+    rdev: u64,
+    flags: u64,
+    uid: u64,
+    gid: u64,
+    acl: ZNodeAcl,
+}
+
+impl ZNodePhys {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (
+            input,
+            (
+                at0,
+                at1,
+                mt0,
+                mt1,
+                ct0,
+                ct1,
+                crt0,
+                crt1,
+                gen,
+                mode,
+                parent,
+                links,
+                xattr,
+                rdev,
+                flags,
+                uid,
+                gid,
+                _pad,
+                acl,
+            ),
+        ) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            nom::bytes::complete::take(8 * 4usize),
+            ZNodeAcl::parse,
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                atime: [at0, at1],
+                mtime: [mt0, mt1],
+                ctime: [ct0, ct1],
+                crtime: [crt0, crt1],
+                gen,
+                mode,
+                parent,
+                links,
+                xattr,
+                rdev,
+                flags,
+                uid,
+                gid,
+                acl,
+            },
+        ))
+    }
+}
+
+pub const ACE_SLOT_CNT: usize = 6;
+
+#[derive(Debug)]
+pub struct ZNodeAcl {
+    extern_obj: u64,
+    count: u32,
+    version: u16,
+    ace_data: [Ace; ACE_SLOT_CNT],
+}
+
+impl ZNodeAcl {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (extern_obj, count, version, _pad, ace_data)) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u32,
+            number::le_u16,
+            nom::bytes::complete::take(2usize),
+            nom::multi::count(Ace::parse, ACE_SLOT_CNT),
+        ))(input)?;
+        let ace_data: &[_; ACE_SLOT_CNT] = (*ace_data).try_into().unwrap();
+        Ok((
+            input,
+            Self {
+                extern_obj,
+                count,
+                version,
+                ace_data: ace_data.clone(),
+            },
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Ace {
+    who: u64,
+    access_mask: u32,
+    flags: u16,
+    kind: u16,
+}
+
+impl Ace {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (who, access_mask, flags, kind)) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u32,
+            number::le_u16,
+            number::le_u16,
+        ))(input)?;
+        Ok((
+            input,
+            Ace {
+                who,
+                access_mask,
+                flags,
+                kind,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZilTrailer {
+    next_blk: BlockPtr,
+    nused: u64,
+    bt: ZioBlockTail,
+}
+
+impl ZilTrailer {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (next_blk, nused, bt)) =
+            nom::sequence::tuple((BlockPtr::parse, number::le_u64, ZioBlockTail::parse))(input)?;
+        Ok((
+            input,
+            Self {
+                next_blk,
+                nused,
+                bt,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZilLogRecord {
+    txtype: u64,
+    reclen: u64,
+    txg: u64,
+    seq: u64,
+}
+
+impl ZilLogRecord {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (txtype, reclen, txg, seq)) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+        ))(input)?;
+        Ok((
+            input,
+            Self {
+                txtype,
+                reclen,
+                txg,
+                seq,
+            },
+        ))
     }
 }
