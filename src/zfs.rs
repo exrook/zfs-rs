@@ -29,7 +29,7 @@ impl Disk {
     }
 }
 
-trait RawDevice {
+pub trait RawDevice {
     type Block: AsRef<[u8]>;
     /// Read the requested amount, given in bytes
     fn read_raw(&self, addr: u64, size: u64) -> IoResult<Self::Block>;
@@ -42,10 +42,11 @@ impl RawDevice for Disk {
     }
 }
 
-enum ZfsError {
+pub enum ZfsError {
     Checksum,
     Parse(nom::error::ErrorKind),
     UnsupportedFeature,
+    NotFound,
     Io(IoError),
 }
 
@@ -66,14 +67,24 @@ impl<T> From<nom::Err<(T, nom::error::ErrorKind)>> for ZfsError {
 }
 
 // TODO: better name
-enum RawOrNah<B> {
+#[derive(Debug)]
+pub enum RawOrNah<B> {
     Raw(B),
     Nah(Vec<u8>),
 }
 
-trait Device {
+impl<B: AsRef<[u8]>> AsRef<[u8]> for RawOrNah<B> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            RawOrNah::Raw(b) => b.as_ref(),
+            RawOrNah::Nah(b) => b.as_ref(),
+        }
+    }
+}
+
+pub trait Device {
     type Block: AsRef<[u8]>;
-    fn get(&self, ptr: BlockPtr) -> Result<RawOrNah<Self::Block>, ZfsError> {
+    fn get(&self, ptr: &BlockPtr) -> Result<RawOrNah<Self::Block>, ZfsError> {
         if ptr.encryption || ptr.embedded_data || ptr.compression_type != CompressionType::LZ4 {
             return Err(ZfsError::UnsupportedFeature);
         }
@@ -144,6 +155,73 @@ where
         // offset is stored in units of 512, byte read_raw takes units of bytes
         // this could overflow offset, but I don't have any 2^55 byte drives to test on
         Ok(self.read_raw(addr.offset << 9 + 0x400000, (addr.asize as u64) << 9)?)
+    }
+}
+
+/// first tuple element is the id into the top level array, the rest is the remainder
+const fn get_block_number(id: u64, level: u8, level_shift: u8) -> (u64, u64) {
+    (
+        id >> (level as u64 * level_shift as u64),
+        id % (1 << (level as u64 * level_shift as u64)),
+    )
+}
+
+pub trait ZFS {
+    type Block: AsRef<[u8]>;
+    fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError>;
+    fn lookup_block(
+        &self,
+        block: &BlockPtr,
+        id: u64,
+        level: u8,
+        level_shift: u8,
+        data_block_size: u32,
+    ) -> Result<Self::Block, ZfsError>;
+}
+
+impl<T, B> ZFS for T
+where
+    T: Device<Block = B>,
+    B: AsRef<[u8]>,
+{
+    type Block = RawOrNah<B>;
+    fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError> {
+        if block_id > dnode.header.max_block_id {
+            return Err(ZfsError::NotFound);
+        }
+        let level_shift = dnode.header.indirect_block_shift - 7;
+        let data_block_size = dnode.header.datablkszsec as u32 * 512;
+        let (idx, new_id) = get_block_number(block_id, dnode.header.levels, level_shift);
+        self.lookup_block(
+            &dnode.block_pointers[idx as usize],
+            new_id,
+            dnode.header.levels - 1,
+            level_shift,
+            data_block_size,
+        )
+    }
+    fn lookup_block(
+        &self,
+        block: &BlockPtr,
+        block_id: u64,
+        level: u8,
+        level_shift: u8,
+        data_block_size: u32,
+    ) -> Result<Self::Block, ZfsError> {
+        let block = self.get(block)?;
+        if level != 0 {
+            let (idx, new_id) = get_block_number(block_id, level, level_shift);
+            let (_input, block_pointer) = BlockPtr::parse(&block.as_ref()[idx as usize * 128..])?;
+            self.lookup_block(
+                &block_pointer,
+                new_id,
+                level - 1,
+                level_shift,
+                data_block_size,
+            )
+        } else {
+            Ok(block)
+        }
     }
 }
 
