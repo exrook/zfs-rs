@@ -10,6 +10,9 @@ use nom::{number::complete as number, IResult};
 
 use enum_repr_derive::TryFrom;
 
+use crc::crc64;
+use crc::CalcType;
+
 use crate::compression::decompress_lz4;
 use crate::fletcher::{Fletcher2, Fletcher4};
 
@@ -168,7 +171,21 @@ const fn get_block_number(id: u64, level: u8, level_shift: u8) -> (u64, u64) {
 
 pub trait ZFS {
     type Block: AsRef<[u8]>;
-    fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError>;
+    fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError> {
+        if block_id > dnode.header.max_block_id {
+            return Err(ZfsError::NotFound);
+        }
+        let level_shift = dnode.header.indirect_block_shift - 7;
+        let data_block_size = dnode.header.datablkszsec as u32 * 512;
+        let (idx, new_id) = get_block_number(block_id, dnode.header.levels, level_shift);
+        self.lookup_block(
+            &dnode.block_pointers[idx as usize],
+            new_id,
+            dnode.header.levels - 1,
+            level_shift,
+            data_block_size,
+        )
+    }
     fn lookup_block(
         &self,
         block: &BlockPtr,
@@ -185,21 +202,6 @@ where
     B: AsRef<[u8]>,
 {
     type Block = RawOrNah<B>;
-    fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError> {
-        if block_id > dnode.header.max_block_id {
-            return Err(ZfsError::NotFound);
-        }
-        let level_shift = dnode.header.indirect_block_shift - 7;
-        let data_block_size = dnode.header.datablkszsec as u32 * 512;
-        let (idx, new_id) = get_block_number(block_id, dnode.header.levels, level_shift);
-        self.lookup_block(
-            &dnode.block_pointers[idx as usize],
-            new_id,
-            dnode.header.levels - 1,
-            level_shift,
-            data_block_size,
-        )
-    }
     fn lookup_block(
         &self,
         block: &BlockPtr,
@@ -1174,6 +1176,11 @@ impl ZapLeafFree {
         ))(input)?;
         Ok((input, ZapLeafChunk::Free(Self { kind, next })))
     }
+}
+
+fn zap_hash(salt: u64, key: &[u8]) -> u64 {
+    let table = crc64::make_table(crc64::ECMA, true);
+    crc64::update(salt, &table, key, &CalcType::Reverse)
 }
 
 #[derive(Debug)]
