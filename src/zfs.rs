@@ -241,8 +241,15 @@ pub trait ZFS {
                     // use embedded pointer table
                     zap_header.leafs[idx as usize]
                 } else {
+                    let block_idx = (idx) / (block_size as u64 / 8);
+                    let idx = idx as usize % (block_size / 8);
+                    if block_idx > zap_header.ptrtbl.numblks {
+                        return Err(ZfsError::Invalid);
+                    }
+                    let tbl = self.read_block(zap_dnode, zap_header.ptrtbl.blk + block_idx)?;
+                    let (_, num) = number::le_u64(&tbl.as_ref()[idx * 8..])?;
+                    num
                     // use external pointer table
-                    return Err(ZfsError::UnsupportedFeature);
                 } {
                     0 => return Ok(None), // Entry not found
                     p => p,
