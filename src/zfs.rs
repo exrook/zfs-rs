@@ -48,6 +48,7 @@ impl RawDevice for Disk {
 pub enum ZfsError {
     Checksum,
     Parse(nom::error::ErrorKind),
+    Invalid,
     UnsupportedFeature,
     NotFound,
     Io(IoError),
@@ -95,7 +96,7 @@ pub trait Device {
             .addresses
             .iter()
             .map(|dva| {
-                let block = self.read(ptr.addresses[0])?;
+                let block = self.read(*dva)?;
                 // check checksums
                 match ptr.checksum_type {
                     ChecksumType::ZILog | ChecksumType::Fletcher2 => {
@@ -161,6 +162,38 @@ where
     }
 }
 
+#[derive(Debug)]
+pub enum ZapResult {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
+impl ZapResult {
+    fn parse(input: &[u8], int_size: u8) -> Option<ZapResult> {
+        match int_size {
+            1 => Some(ZapResult::U8(input.to_owned())),
+            2 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::le_u16))(
+                input,
+            )
+            .ok()
+            .map(|o| ZapResult::U16(o.1)),
+            4 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::le_u32))(
+                input,
+            )
+            .ok()
+            .map(|o| ZapResult::U32(o.1)),
+            8 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::le_u64))(
+                input,
+            )
+            .ok()
+            .map(|o| ZapResult::U64(o.1)),
+            _ => None,
+        }
+    }
+}
+
 /// first tuple element is the id into the top level array, the rest is the remainder
 const fn get_block_number(id: u64, level: u8, level_shift: u8) -> (u64, u64) {
     (
@@ -194,6 +227,46 @@ pub trait ZFS {
         level_shift: u8,
         data_block_size: u32,
     ) -> Result<Self::Block, ZfsError>;
+    fn read_zap(&self, zap_dnode: &DNodePhys, key: &[u8]) -> Result<Option<ZapResult>, ZfsError> {
+        let input = self.read_block(zap_dnode, 0)?;
+        let block_size = zap_dnode.header.datablkszsec as usize * 512;
+        let leaf_block_shift = ZAP_LEAF_HASH_NUMENTRIES(block_size).trailing_zeros();
+        let (input, zap_header) = ZapBlock::parse(input.as_ref(), block_size)?;
+        match zap_header {
+            ZapBlock::MicroZap(micro) => Ok(micro.lookup(key).map(|k| ZapResult::U64(vec![k]))),
+            ZapBlock::FatHeader(zap_header) => {
+                let hash = zap_hash(zap_header.salt, key);
+                let idx = zap_hash_idx(hash, zap_header.ptrtbl.shift as u8);
+                let mut leaf_block_num = match if (zap_header.ptrtbl.blk == 0) {
+                    // use embedded pointer table
+                    zap_header.leafs[idx as usize]
+                } else {
+                    // use external pointer table
+                    return Err(ZfsError::UnsupportedFeature);
+                } {
+                    0 => return Ok(None), // Entry not found
+                    p => p,
+                };
+                // loop through the chained leaf blocks
+                loop {
+                    let input = self.read_block(zap_dnode, leaf_block_num)?;
+                    let (input, leaf_block) = ZapLeafPhys::parse(input.as_ref(), block_size)?;
+                    match leaf_block.lookup(key, hash, leaf_block_shift) {
+                        Some(v) => return Ok(Some(v)),
+                        None => {}
+                    }
+                    if leaf_block.hdr.next == 0 {
+                        return Ok(None);
+                    }
+                    leaf_block_num = leaf_block.hdr.next;
+                }
+            }
+            ZapBlock::FatLeaf(_) => Err(ZfsError::Invalid),
+        }
+    }
+    fn zap_entries(&self, zap_dnode: &DNodePhys) -> Result<Vec<(Vec<u8>, ZapResult)>, ZfsError> {
+        todo!()
+    }
 }
 
 impl<T, B> ZFS for T
@@ -828,21 +901,41 @@ const ZBT_MICRO: u64 = (1 << 63) + 3;
 const ZBT_HEADER: u64 = (1 << 63) + 1;
 const ZBT_LEAF: u64 = (1 << 63) + 0;
 
+enum ZapBlock {
+    MicroZap(MZapPhys),
+    FatHeader(ZapPhys),
+    FatLeaf(ZapLeafPhys),
+}
+
+impl ZapBlock {
+    /// block_size in bytes
+    pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
+        nom::branch::alt((
+            nom::combinator::map(|i| MZapPhys::parse(i, block_size), Self::MicroZap),
+            nom::combinator::map(ZapPhys::parse, Self::FatHeader),
+            nom::combinator::map(|i| ZapLeafPhys::parse(i, block_size), Self::FatLeaf),
+        ))(input)
+    }
+}
+
 #[derive(Debug)]
 pub struct MZapPhys {
     block_type: u64,
     salt: u64,
+    normflags: u64,
     entries: Vec<MZapEntryPhys>,
 }
 
 impl MZapPhys {
+    /// block_size in bytes
     pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
-        let (input, (block_type, salt, _pad, entries)) = nom::combinator::map_parser(
+        let (input, (block_type, salt, normflags, _pad, entries)) = nom::combinator::map_parser(
             nom::bytes::complete::take(block_size),
             nom::sequence::tuple((
                 nom::combinator::verify(number::le_u64, |btype| *btype == ZBT_MICRO),
                 number::le_u64,
-                nom::bytes::complete::take(48usize),
+                number::le_u64,
+                nom::bytes::complete::take(40usize),
                 nom::multi::many1(MZapEntryPhys::parse),
             )),
         )(input)?;
@@ -851,9 +944,29 @@ impl MZapPhys {
             Self {
                 block_type,
                 salt,
+                normflags,
                 entries,
             },
         ))
+    }
+    pub fn lookup(&self, key: &[u8]) -> Option<u64> {
+        if key.len() >= 50 {
+            // mzap strings are 50 bytes long max, including null terminators
+            return None;
+        }
+        let hash = zap_hash(self.salt, key);
+        let bits = (self.entries.len() + 1).trailing_zeros();
+        let mut idx = zap_hash_idx(hash, bits as u8) as usize & self.entries.len();
+        loop {
+            let entry = &self.entries[idx];
+            if entry.name[0] == 0 {
+                return None;
+            }
+            if &entry.name[..key.len()] == key && entry.name[key.len()] == 0 {
+                return Some(entry.value);
+            }
+            idx = (idx + 1) & self.entries.len();
+        }
     }
 }
 
@@ -994,6 +1107,17 @@ const fn ZAP_LEAF_NUMCHUNKS(block_size: usize) -> usize {
     (block_size - (2 * ZAP_LEAF_HASH_NUMENTRIES(block_size)) / 24) - 2
 }
 
+const ZAP_CHAIN_END: u16 = 0xffff;
+
+// take the entry_shift number bits following prefix_len number of bits
+// 0 0 0 0 0 0 0 1 1 1 1 1 0 0 ....
+// | prefix_len | entry_shift |
+//                ^ take these
+fn leaf_idx(hash: u64, entry_shift: u32, prefix_len: u16) -> u64 {
+    let shifted = hash >> (64 - entry_shift as u64 - prefix_len as u64);
+    shifted & ((1 << entry_shift) - 1) // mask the high bits we don't want
+}
+
 #[derive(Debug)]
 pub struct ZapLeafPhys {
     hdr: ZapLeafHeader,
@@ -1004,6 +1128,7 @@ pub struct ZapLeafPhys {
 }
 
 impl ZapLeafPhys {
+    /// block_size in bytes
     pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
         let (input, (hdr, hash, chunks)) = nom::sequence::tuple((
             ZapLeafHeader::parse,
@@ -1011,6 +1136,44 @@ impl ZapLeafPhys {
             nom::multi::count(ZapLeafChunk::parse, ZAP_LEAF_NUMCHUNKS(block_size)),
         ))(input)?;
         Ok((input, Self { hdr, hash, chunks }))
+    }
+    pub fn lookup(&self, key: &[u8], hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
+        let mut leaf_idx = leaf_idx(hash, leaf_block_shift, self.hdr.prefix_len);
+        loop {
+            let chunk = match &self.chunks[leaf_idx as usize] {
+                ZapLeafChunk::Entry(e) => e,
+                _ => return None,
+            };
+            // get name without the trailing null
+            let name = match self.get_array(chunk.name_chunk, chunk.name_length as usize - 1) {
+                Some(a) => a,
+                _ => return None,
+            };
+            if name == key {
+                let array = self.get_array(chunk.value_chunk, chunk.value_length as usize)?;
+                return ZapResult::parse(&array, chunk.int_size);
+            }
+            if chunk.next == ZAP_CHAIN_END {
+                return None;
+            }
+            leaf_idx = chunk.next as u64
+        }
+    }
+    fn get_array(&self, mut array_idx: u16, length: usize) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(length);
+        loop {
+            let a = match &self.chunks[array_idx as usize] {
+                ZapLeafChunk::Array(a) => a,
+                _ => return None,
+            };
+            out.extend(&a.array);
+            if a.next == ZAP_CHAIN_END {
+                out.truncate(length);
+                return Some(out);
+            } else {
+                array_idx = a.next
+            }
+        }
     }
 }
 
@@ -1175,6 +1338,14 @@ impl ZapLeafFree {
             number::le_u16,
         ))(input)?;
         Ok((input, ZapLeafChunk::Free(Self { kind, next })))
+    }
+}
+
+fn zap_hash_idx(hash: u64, shift: u8) -> u64 {
+    if shift > 0 {
+        hash >> (64 - shift)
+    } else {
+        0
     }
 }
 
