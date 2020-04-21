@@ -1,4 +1,5 @@
 use std::convert::{TryFrom, TryInto};
+use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
 use std::io::Error as IoError;
@@ -271,8 +272,43 @@ pub trait ZFS {
             ZapBlock::FatLeaf(_) => Err(ZfsError::Invalid),
         }
     }
-    fn zap_entries(&self, zap_dnode: &DNodePhys) -> Result<Vec<(Vec<u8>, ZapResult)>, ZfsError> {
-        todo!()
+    fn zap_entries(&self, zap_dnode: &DNodePhys) -> Result<Vec<(CString, ZapResult)>, ZfsError> {
+        let input = self.read_block(zap_dnode, 0)?;
+        let block_size = zap_dnode.header.datablkszsec as usize * 512;
+        let (input, zap_header) = ZapBlock::parse(input.as_ref(), block_size)?;
+        match zap_header {
+            ZapBlock::MicroZap(micro) => Ok(micro
+                .get_entries()
+                .into_iter()
+                .map(|(key, val)| (key, ZapResult::U64(vec![val])))
+                .collect()),
+            ZapBlock::FatHeader(zap_header) => {
+                let block_list: Vec<u64> = if zap_header.ptrtbl.blk == 0 {
+                    zap_header
+                        .leafs
+                        .iter()
+                        .filter(|p| **p != 0)
+                        .map(|i| *i)
+                        .collect()
+                } else {
+                    let mut out = vec![];
+                    for i in (0..zap_header.ptrtbl.numblks) {
+                        let block = self.read_block(zap_dnode, zap_header.ptrtbl.blk + i)?;
+                        let nums = nom::multi::many0(number::le_u64)(block.as_ref())?.1;
+                        out.extend(nums.into_iter().filter(|p| *p != 0));
+                    }
+                    out
+                };
+                let mut out = vec![];
+                for blocknum in block_list {
+                    let input = self.read_block(zap_dnode, blocknum)?;
+                    let (input, leaf_block) = ZapLeafPhys::parse(input.as_ref(), block_size)?;
+                    out.extend(leaf_block.get_entries())
+                }
+                Ok(out)
+            }
+            ZapBlock::FatLeaf(_) => Err(ZfsError::Invalid),
+        }
     }
 }
 
@@ -975,6 +1011,16 @@ impl MZapPhys {
             idx = (idx + 1) & self.entries.len();
         }
     }
+    pub fn get_entries(&self) -> Vec<(CString, u64)> {
+        self.entries
+            .iter()
+            .filter(|e| e.name[0] != 0)
+            .map(|e| {
+                let null_idx = e.name.iter().position(|c| *c == 0).unwrap_or(e.name.len());
+                (CString::new(&e.name[..null_idx]).unwrap(), e.value) // we found the null byte so this should never panic
+            })
+            .collect()
+    }
 }
 
 pub struct MZapEntryPhys {
@@ -1182,6 +1228,21 @@ impl ZapLeafPhys {
             }
         }
     }
+    pub fn get_entries(&self) -> Vec<(CString, ZapResult)> {
+        self.chunks
+            .iter()
+            .filter_map(ZapLeafChunk::entry_ref)
+            .filter_map(|entry| {
+                // exclude the terminating null
+                let name =
+                    CString::new(self.get_array(entry.name_chunk, entry.name_length as usize - 1)?)
+                        .ok()?;
+                let value = self.get_array(entry.value_chunk, entry.value_length as usize)?;
+                let value = ZapResult::parse(&value, entry.int_size)?;
+                Some((name, value))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -1245,6 +1306,20 @@ pub enum ZapLeafChunk {
 impl ZapLeafChunk {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         nom::branch::alt((ZapLeafEntry::parse, ZapLeafArray::parse, ZapLeafFree::parse))(input)
+    }
+    pub fn entry(self) -> Option<ZapLeafEntry> {
+        use ZapLeafChunk::*;
+        match self {
+            Entry(e) => Some(e),
+            _ => None,
+        }
+    }
+    pub fn entry_ref(&self) -> Option<&ZapLeafEntry> {
+        use ZapLeafChunk::*;
+        match self {
+            Entry(e) => Some(e),
+            _ => None,
+        }
     }
 }
 
