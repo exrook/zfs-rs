@@ -12,11 +12,7 @@ use rocket::http::{RawStr, Status};
 use rocket::request::FromParam;
 use rocket::{Outcome, Request, State};
 
-mod compression;
-mod fletcher;
-mod zfs;
-
-use zfs::Disk;
+use zfs_rs::Disk;
 
 fn main() {
     println!("Hello, world!");
@@ -45,17 +41,17 @@ fn block(dev: State<Disk>, vdev: u32, id: NumFromHex, asize: u32, view: Option<S
         Some("d") => {
             let data = dev.read(address, 64).unwrap();
             let address = address + 64;
-            let dnode = zfs::DNodePhysHeader::from_raw(&data);
+            let dnode = zfs_rs::DNodePhysHeader::from_raw(&data);
             writeln!(output, "{:#?}", dnode);
             for i in (0..dnode.num_block_ptr as u64) {
                 let data = dev.read(address + i * 128, 128).unwrap();
-                let blockptr = zfs::BlockPtr::from_raw(&data);
+                let blockptr = zfs_rs::BlockPtr::from_raw(&data);
                 writeln!(output, "{:#?}", blockptr);
             }
         }
         Some("b") => {
             let data = dev.read(address, 128).unwrap();
-            let blockptr = zfs::BlockPtr::from_raw(&data);
+            let blockptr = zfs_rs::BlockPtr::from_raw(&data);
             write!(output, "{:?}", blockptr);
         }
         _ => {}
@@ -82,10 +78,11 @@ fn block_compressed(
     match view.as_deref() {
         None => {}
         Some("d") => {
-            let dnode = zfs::DNodePhysHeader::from_raw(&data[0..64]);
+            let dnode = zfs_rs::DNodePhysHeader::from_raw(&data[0..64]);
             writeln!(output, "{:#?}", dnode);
             for i in (0..dnode.num_block_ptr as usize) {
-                let blockptr = zfs::BlockPtr::from_raw(&data[(64 + i * 128)..(64 + 128 + i * 128)]);
+                let blockptr =
+                    zfs_rs::BlockPtr::from_raw(&data[(64 + i * 128)..(64 + 128 + i * 128)]);
                 writeln!(output, "{:#?}", blockptr);
             }
             if dnode.bonus_len > 0 {
@@ -95,7 +92,7 @@ fn block_compressed(
             }
         }
         Some("b") => {
-            let blockptr = zfs::BlockPtr::from_raw(&data[0..128]);
+            let blockptr = zfs_rs::BlockPtr::from_raw(&data[0..128]);
             write!(output, "{:?}", blockptr);
         }
         Some("r") => {

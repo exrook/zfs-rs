@@ -14,6 +14,9 @@ use enum_repr_derive::TryFrom;
 use crc::crc64;
 use crc::CalcType;
 
+mod compression;
+mod fletcher;
+
 use crate::compression::decompress_lz4;
 use crate::fletcher::{Fletcher2, Fletcher4};
 

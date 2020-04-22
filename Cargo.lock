@@ -686,7 +686,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9fc79f4a1e39857fc00c3f662cbf2651c771f00e9c15fe2abc341806bd46bd71"
 
 [[package]]
-name = "zfsbrowser"
+name = "zfs-rs"
 version = "0.1.0"
 dependencies = [
  "crc",
@@ -694,4 +694,13 @@ dependencies = [
  "lz4-compression",
  "nom",
  "rocket",
+]
+
+[[package]]
+name = "zfsbrowser"
+version = "0.1.0"
+dependencies = [
+ "lz4-compression",
+ "rocket",
+ "zfs-rs",
 ]
