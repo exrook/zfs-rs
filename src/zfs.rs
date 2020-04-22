@@ -145,6 +145,7 @@ pub trait Device {
             Err(o) => Ok(o),
         }
     }
+    fn get_label(&self, label_num: u8) -> Result<Label, ZfsError>;
     fn read(&self, addr: DVA) -> Result<Self::Block, ZfsError>;
 }
 
@@ -153,6 +154,17 @@ where
     T: RawDevice<Block = B>,
 {
     type Block = B;
+    fn get_label(&self, label_num: u8) -> Result<Label, ZfsError> {
+        if label_num < 2 {
+            Ok(Label::parse(
+                self.read_raw(label_num as u64 * 256 * 1024, 256 * 1024)?
+                    .as_ref(),
+            )?
+            .1)
+        } else {
+            Err(ZfsError::UnsupportedFeature)
+        }
+    }
     fn read(&self, addr: DVA) -> Result<Self::Block, ZfsError> {
         if addr.gang {
             return Err(ZfsError::UnsupportedFeature);
@@ -340,6 +352,105 @@ where
         } else {
             Ok(block)
         }
+    }
+}
+
+// TODO: implement boot_header and nv_pairs parsing
+#[derive(Debug)]
+pub struct Label {
+    boot_header: Vec<u8>,
+    nv_pairs: Vec<u8>,
+    uberblocks: Vec<Uberblock>,
+}
+
+impl Label {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (_pad, boot_header, nv_pairs, uberblocks)) = nom::sequence::tuple((
+            nom::bytes::complete::take(8 * 1024usize),
+            nom::bytes::complete::take(8 * 1024usize),
+            nom::bytes::complete::take(112 * 1024usize),
+            nom::bytes::complete::take(128 * 1024usize),
+        ))(input)?;
+        let asize = 12; // TODO: read this from nv_pairs
+        let uberblock_count = 1 << (17 - asize.min(10));
+        let uberblock_size = 1 << asize.min(10);
+        let (_, uberblocks) = nom::multi::count(
+            |i| Uberblock::parse(i, uberblock_size),
+            uberblock_count,
+        )(uberblocks)?;
+        Ok((
+            input,
+            Self {
+                boot_header: boot_header.to_vec(),
+                nv_pairs: nv_pairs.to_vec(),
+                uberblocks,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+pub struct Uberblock {
+    magic: u64,
+    version: u64,
+    txg: u64,
+    guid_sum: u64,
+    timestamp: u64,
+    rootbp: BlockPtr,
+    software_version: u64,
+    mmp_magic: u64,
+    mmp_delay: u64,
+    mmp_config: u64,
+    checkpoint_txg: u64,
+}
+
+impl Uberblock {
+    pub fn parse(input: &[u8], size: usize) -> IResult<&[u8], Self> {
+        let (input, block) = nom::bytes::complete::take(size)(input)?;
+        let (
+            block,
+            (
+                magic,
+                version,
+                txg,
+                guid_sum,
+                timestamp,
+                rootbp,
+                software_version,
+                mmp_magic,
+                mmp_delay,
+                mmp_config,
+                checkpoint_txg,
+            ),
+        ) = nom::sequence::tuple((
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            BlockPtr::parse,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+            number::le_u64,
+        ))(block)?;
+        Ok((
+            input,
+            Self {
+                magic,
+                version,
+                txg,
+                guid_sum,
+                timestamp,
+                rootbp,
+                software_version,
+                mmp_magic,
+                mmp_delay,
+                mmp_config,
+                checkpoint_txg,
+            },
+        ))
     }
 }
 
