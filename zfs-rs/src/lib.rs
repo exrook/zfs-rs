@@ -1,3 +1,5 @@
+#![feature(backtrace)]
+use std::backtrace::Backtrace;
 use std::convert::{TryFrom, TryInto};
 use std::ffi::CString;
 use std::fmt;
@@ -6,6 +8,8 @@ use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+
+use thiserror::Error;
 
 use nom::{number::complete as number, IResult};
 
@@ -20,14 +24,15 @@ mod fletcher;
 use crate::compression::decompress_lz4;
 use crate::fletcher::{Fletcher2, Fletcher4};
 
+#[derive(Debug)]
 pub struct Disk {
     file: File,
 }
 
 impl Disk {
-    pub fn new<P: AsRef<Path>>(path: P) -> Self {
-        let f = File::open(path).unwrap();
-        Self { file: f }
+    pub fn new<P: AsRef<Path>>(path: P) -> IoResult<Self> {
+        let f = File::open(path)?;
+        Ok(Self { file: f })
     }
     pub fn read(&self, address: u64, len: u64) -> IoResult<Vec<u8>> {
         let mut buf = vec![0; len as usize];
@@ -49,22 +54,49 @@ impl RawDevice for Disk {
     }
 }
 
-pub enum ZfsError {
-    Checksum,
-    Parse(nom::error::ErrorKind),
-    Invalid,
-    UnsupportedFeature,
-    NotFound,
-    Io(IoError),
+#[derive(Debug, Error)]
+#[error("{source}, {backtrace}")]
+pub struct ZfsError {
+    #[from]
+    pub source: ZfsErrorKind,
+    backtrace: Backtrace,
 }
 
 impl From<IoError> for ZfsError {
+    fn from(e: IoError) -> Self {
+        ZfsErrorKind::from(e).into()
+    }
+}
+
+impl<T> From<nom::Err<(T, nom::error::ErrorKind)>> for ZfsError {
+    fn from(e: nom::Err<(T, nom::error::ErrorKind)>) -> Self {
+        ZfsErrorKind::from(e).into()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ZfsErrorKind {
+    #[error("Checksum validation error")]
+    Checksum,
+    #[error("Data parse error {0:?}")]
+    Parse(nom::error::ErrorKind),
+    #[error("Invalid data error")]
+    Invalid,
+    #[error("Unsupported feature present")]
+    UnsupportedFeature,
+    #[error("Required data not found")]
+    NotFound,
+    #[error("IO Error {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for ZfsErrorKind {
     fn from(e: IoError) -> Self {
         Self::Io(e)
     }
 }
 
-impl<T> From<nom::Err<(T, nom::error::ErrorKind)>> for ZfsError {
+impl<T> From<nom::Err<(T, nom::error::ErrorKind)>> for ZfsErrorKind {
     fn from(e: nom::Err<(T, nom::error::ErrorKind)>) -> Self {
         Self::Parse(match e {
             nom::Err::Incomplete(_) => nom::error::ErrorKind::Complete,
@@ -93,8 +125,13 @@ impl<B: AsRef<[u8]>> AsRef<[u8]> for RawOrNah<B> {
 pub trait Device {
     type Block: AsRef<[u8]>;
     fn get(&self, ptr: &BlockPtr) -> Result<RawOrNah<Self::Block>, ZfsError> {
-        if ptr.encryption || ptr.embedded_data || ptr.compression_type != CompressionType::LZ4 {
-            return Err(ZfsError::UnsupportedFeature);
+        if ptr.encryption
+            || ptr.embedded_data
+            || !(ptr.compression_type == CompressionType::LZ4
+                || ptr.compression_type == CompressionType::Off
+                || ptr.compression_type == CompressionType::On)
+        {
+            return Err(ZfsErrorKind::UnsupportedFeature)?;
         }
         let r: Result<Vec<ZfsError>, RawOrNah<Self::Block>> = ptr
             .addresses
@@ -109,7 +146,7 @@ pub trait Device {
                         if ptr.checksum == cksum.into() {
                             Ok(())
                         } else {
-                            Err(ZfsError::Checksum)
+                            Err(ZfsErrorKind::Checksum)
                         }
                     }
                     ChecksumType::On | ChecksumType::Fletcher4 => {
@@ -118,24 +155,26 @@ pub trait Device {
                         if ptr.checksum == cksum.into() {
                             Ok(())
                         } else {
-                            Err(ZfsError::Checksum)
+                            Err(ZfsErrorKind::Checksum)
                         }
                     }
                     ChecksumType::Label | ChecksumType::GangHeader | ChecksumType::SHA256 => {
                         // SHA256
-                        Err(ZfsError::UnsupportedFeature)
+                        Err(ZfsErrorKind::UnsupportedFeature)
                     }
                     ChecksumType::Off => Ok(()), // do nothing
                     _ => {
                         // unsupported
-                        Err(ZfsError::UnsupportedFeature)
+                        Err(ZfsErrorKind::UnsupportedFeature)
                     }
                 }?;
                 // decompress
                 Ok(match ptr.compression_type {
                     CompressionType::Off => RawOrNah::Raw(block),
-                    CompressionType::LZ4 => RawOrNah::Nah(decompress_lz4(block.as_ref())?.1),
-                    _ => Err(ZfsError::UnsupportedFeature)?,
+                    CompressionType::LZ4 | CompressionType::On => {
+                        RawOrNah::Nah(decompress_lz4(block.as_ref())?.1)
+                    }
+                    _ => Err(ZfsErrorKind::UnsupportedFeature)?,
                 })
             })
             .map(|r| match r {
@@ -165,20 +204,20 @@ where
             )?
             .1)
         } else {
-            Err(ZfsError::UnsupportedFeature)
+            Err(ZfsErrorKind::UnsupportedFeature.into())
         }
     }
     fn read(&self, addr: DVA) -> Result<Self::Block, ZfsError> {
         if addr.gang {
-            return Err(ZfsError::UnsupportedFeature);
+            return Err(ZfsErrorKind::UnsupportedFeature.into());
         }
         // offset is stored in units of 512, byte read_raw takes units of bytes
         // this could overflow offset, but I don't have any 2^55 byte drives to test on
-        Ok(self.read_raw(addr.offset << 9 + 0x400000, (addr.asize as u64) << 9)?)
+        Ok(self.read_raw((addr.offset << 9) + 0x400000, (addr.asize as u64) << 9)?)
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ZapResult {
     U8(Vec<u8>),
     U16(Vec<u16>),
@@ -222,7 +261,7 @@ pub trait ZFS {
     type Block: AsRef<[u8]>;
     fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError> {
         if block_id > dnode.header.max_block_id {
-            return Err(ZfsError::NotFound);
+            return Err(ZfsErrorKind::NotFound.into());
         }
         let level_shift = dnode.header.indirect_block_shift - 7;
         let data_block_size = dnode.header.datablkszsec as u32 * 512;
@@ -260,7 +299,7 @@ pub trait ZFS {
                     let block_idx = (idx) / (block_size as u64 / 8);
                     let idx = idx as usize % (block_size / 8);
                     if block_idx > zap_header.ptrtbl.numblks {
-                        return Err(ZfsError::Invalid);
+                        return Err(ZfsErrorKind::Invalid.into());
                     }
                     let tbl = self.read_block(zap_dnode, zap_header.ptrtbl.blk + block_idx)?;
                     let (_, num) = number::le_u64(&tbl.as_ref()[idx * 8..])?;
@@ -284,7 +323,7 @@ pub trait ZFS {
                     leaf_block_num = leaf_block.hdr.next;
                 }
             }
-            ZapBlock::FatLeaf(_) => Err(ZfsError::Invalid),
+            ZapBlock::FatLeaf(_) => Err(ZfsErrorKind::Invalid.into()),
         }
     }
     fn zap_entries(&self, zap_dnode: &DNodePhys) -> Result<Vec<(CString, ZapResult)>, ZfsError> {
@@ -322,7 +361,7 @@ pub trait ZFS {
                 }
                 Ok(out)
             }
-            ZapBlock::FatLeaf(_) => Err(ZfsError::Invalid),
+            ZapBlock::FatLeaf(_) => Err(ZfsErrorKind::Invalid.into()),
         }
     }
 }
@@ -359,11 +398,11 @@ where
 }
 
 // TODO: implement boot_header and nv_pairs parsing
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Label {
-    boot_header: Vec<u8>,
-    nv_pairs: Vec<u8>,
-    uberblocks: Vec<Uberblock>,
+    pub boot_header: Vec<u8>,
+    pub nv_pairs: Vec<u8>,
+    pub uberblocks: Vec<Uberblock>,
 }
 
 impl Label {
@@ -375,8 +414,8 @@ impl Label {
             nom::bytes::complete::take(128 * 1024usize),
         ))(input)?;
         let asize = 12; // TODO: read this from nv_pairs
-        let uberblock_count = 1 << (17 - asize.min(10));
-        let uberblock_size = 1 << asize.min(10);
+        let uberblock_count = 1 << (17 - asize.max(10));
+        let uberblock_size = 1 << asize.max(10);
         let (_, uberblocks) = nom::multi::count(
             |i| Uberblock::parse(i, uberblock_size),
             uberblock_count,
@@ -392,19 +431,19 @@ impl Label {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Uberblock {
-    magic: u64,
-    version: u64,
-    txg: u64,
-    guid_sum: u64,
-    timestamp: u64,
-    rootbp: BlockPtr,
-    software_version: u64,
-    mmp_magic: u64,
-    mmp_delay: u64,
-    mmp_config: u64,
-    checkpoint_txg: u64,
+    pub magic: u64,
+    pub version: u64,
+    pub txg: u64,
+    pub guid_sum: u64,
+    pub timestamp: u64,
+    pub rootbp: BlockPtr,
+    pub software_version: u64,
+    pub mmp_magic: u64,
+    pub mmp_delay: u64,
+    pub mmp_config: u64,
+    pub checkpoint_txg: u64,
 }
 
 impl Uberblock {
@@ -487,8 +526,11 @@ impl DVA {
         use nom::{bits, take_bits, tuple};
         let (input, (asize, grid, vdev)) =
             nom::sequence::tuple((number::le_u24, number::le_u8, number::le_u32))(input)?;
-        let (input, (offset, gang)): (_, (u64, u8)) =
-            bits!(input, tuple!(take_bits!(63usize), take_bits!(1usize)))?;
+        let (input, offset_gang) = number::le_u64(input)?;
+        let gang = offset_gang & (1 << 63);
+        let offset = offset_gang & ((1 << 63) - 1);
+        //let (input, (offset, gang)): (_, (u64, u8)) =
+        //    bits!(input, tuple!(take_bits!(63usize), take_bits!(1usize)))?;
         let gang = if gang == 0 { false } else { true };
         Ok((
             input,
@@ -503,9 +545,9 @@ impl DVA {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Checksum {
-    checksum: [u64; 4],
+    pub checksum: [u64; 4],
 }
 
 impl From<Fletcher4> for Checksum {
@@ -542,8 +584,8 @@ impl Checksum {
 }
 
 #[repr(u8)]
-#[derive(Debug, TryFrom, Eq, PartialEq)]
-enum CompressionType {
+#[derive(Debug, Clone, TryFrom, Eq, PartialEq)]
+pub enum CompressionType {
     Inherit = 0,
     On = 1,
     Off = 2,
@@ -569,8 +611,8 @@ impl CompressionType {
 }
 
 #[repr(u8)]
-#[derive(Debug, TryFrom, Eq, PartialEq)]
-enum ChecksumType {
+#[derive(Debug, Clone, TryFrom, Eq, PartialEq)]
+pub enum ChecksumType {
     Inherit = 0,
     On = 1,
     Off = 2,
@@ -592,23 +634,23 @@ impl ChecksumType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BlockPtr {
-    addresses: [DVA; 3],
-    byteorder: bool,
-    dedup: bool,
-    encryption: bool,
-    indirection_level: u8,
-    kind: u8,
-    checksum_type: ChecksumType,
-    compression_type: CompressionType,
-    embedded_data: bool,
-    physical_size: u16,
-    logical_size: u16,
-    physical_transaction: u64,
-    logical_transaction: u64,
-    fill_count: u64,
-    checksum: Checksum,
+    pub addresses: [DVA; 3],
+    pub byteorder: bool,
+    pub dedup: bool,
+    pub encryption: bool,
+    pub indirection_level: u8,
+    pub kind: u8,
+    pub checksum_type: ChecksumType,
+    pub compression_type: CompressionType,
+    pub embedded_data: bool,
+    pub physical_size: u16,
+    pub logical_size: u16,
+    pub physical_transaction: u64,
+    pub logical_transaction: u64,
+    pub fill_count: u64,
+    pub checksum: Checksum,
 }
 
 impl BlockPtr {
@@ -676,10 +718,10 @@ impl BlockPtr {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZioGbh {
-    blkptr: [BlockPtr; 3],
-    tail: ZioBlockTail,
+    pub blkptr: [BlockPtr; 3],
+    pub tail: ZioBlockTail,
 }
 
 impl ZioGbh {
@@ -701,10 +743,10 @@ impl ZioGbh {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZioBlockTail {
-    magic: u64,
-    checksum: Checksum,
+    pub magic: u64,
+    pub checksum: Checksum,
 }
 
 impl ZioBlockTail {
@@ -715,7 +757,7 @@ impl ZioBlockTail {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DNodePhysHeader {
     pub kind: u8,
     pub indirect_block_shift: u8,
@@ -773,11 +815,11 @@ impl DNodePhysHeader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DNodePhys {
-    header: DNodePhysHeader,
-    block_pointers: Vec<BlockPtr>,
-    bonus: Vec<u8>,
+    pub header: DNodePhysHeader,
+    pub block_pointers: Vec<BlockPtr>,
+    pub bonus: Vec<u8>,
 }
 
 impl DNodePhys {
@@ -799,11 +841,11 @@ impl DNodePhys {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjsetPhys {
-    metadnode: DNodePhys,
-    os_zil_header: ZilHeader,
-    os_type: OsType,
+    pub metadnode: DNodePhys,
+    pub os_zil_header: ZilHeader,
+    pub os_type: OsType,
 }
 
 impl ObjsetPhys {
@@ -823,11 +865,11 @@ impl ObjsetPhys {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZilHeader {
-    claim_txg: u64,
-    replay_seq: u64,
-    log: BlockPtr,
+    pub claim_txg: u64,
+    pub replay_seq: u64,
+    pub log: BlockPtr,
 }
 
 impl ZilHeader {
@@ -845,7 +887,7 @@ impl ZilHeader {
     }
 }
 
-#[derive(Debug, TryFrom)]
+#[derive(Debug, Clone, TryFrom)]
 #[repr(u64)]
 pub enum OsType {
     NONE = 0,
@@ -860,28 +902,28 @@ impl OsType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DatasetPhys {
-    dir_obj: u64,
-    prev_snap_obj: u64,
-    prev_snap_obj_transaction: u64,
-    next_snap_obj: u64,
-    snapnames_zapobj: u64,
-    num_children: u64,
-    creation_time: u64,
-    creation_txg: u64,
-    deadlist_obj: u64,
-    referenced_bytes: u64,
-    compressed_bytes: u64,
-    uncompressed_bytes: u64,
-    unique_bytes: u64,
-    fsid_guid: u64,
-    guid: u64,
-    flags: u64,
-    bp: BlockPtr,
-    next_clones_obj: u64,
-    props_obj: u64,
-    userrefs_obj: u64,
+    pub dir_obj: u64,
+    pub prev_snap_obj: u64,
+    pub prev_snap_obj_transaction: u64,
+    pub next_snap_obj: u64,
+    pub snapnames_zapobj: u64,
+    pub num_children: u64,
+    pub creation_time: u64,
+    pub creation_txg: u64,
+    pub deadlist_obj: u64,
+    pub referenced_bytes: u64,
+    pub compressed_bytes: u64,
+    pub uncompressed_bytes: u64,
+    pub unique_bytes: u64,
+    pub fsid_guid: u64,
+    pub guid: u64,
+    pub flags: u64,
+    pub bp: BlockPtr,
+    pub next_clones_obj: u64,
+    pub props_obj: u64,
+    pub userrefs_obj: u64,
 }
 
 impl DatasetPhys {
@@ -963,23 +1005,23 @@ impl DatasetPhys {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DirPhys {
-    creation_time: u64,
-    head_dataset_obj: u64,
-    parent_obj: u64,
-    clone_parent_obj: u64,
-    clone_dir_zapobj: u64,
-    used_bytes: u64,
-    compressed_bytes: u64,
-    uncompressed_bytes: u64,
-    quota: u64,
-    reserved: u64,
-    props_zapobj: u64,
-    deleg_zapobj: u64,
-    flags: u64,
-    used_breakdown: [u64; 5],
-    clones: u64,
+    pub creation_time: u64,
+    pub head_dataset_obj: u64,
+    pub parent_obj: u64,
+    pub clone_parent_obj: u64,
+    pub clone_dir_zapobj: u64,
+    pub used_bytes: u64,
+    pub compressed_bytes: u64,
+    pub uncompressed_bytes: u64,
+    pub quota: u64,
+    pub reserved: u64,
+    pub props_zapobj: u64,
+    pub deleg_zapobj: u64,
+    pub flags: u64,
+    pub used_breakdown: [u64; 5],
+    pub clones: u64,
 }
 
 impl DirPhys {
@@ -1075,12 +1117,12 @@ impl ZapBlock {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MZapPhys {
-    block_type: u64,
-    salt: u64,
-    normflags: u64,
-    entries: Vec<MZapEntryPhys>,
+    pub block_type: u64,
+    pub salt: u64,
+    pub normflags: u64,
+    pub entries: Vec<MZapEntryPhys>,
 }
 
 impl MZapPhys {
@@ -1137,11 +1179,12 @@ impl MZapPhys {
     }
 }
 
+#[derive(Clone)]
 pub struct MZapEntryPhys {
-    value: u64,
-    cd: u32,
+    pub value: u64,
+    pub cd: u32,
     //name: [u8; 50],
-    name: Vec<u8>,
+    pub name: Vec<u8>,
 }
 
 impl MZapEntryPhys {
@@ -1172,16 +1215,17 @@ impl fmt::Debug for MZapEntryPhys {
     }
 }
 
+#[derive(Clone)]
 pub struct ZapPhys {
-    block_type: u64,
-    magic: u64,
-    ptrtbl: ZapTablePhys,
-    freeblk: u64,
-    num_leafs: u64,
-    num_entries: u64,
-    salt: u64,
+    pub block_type: u64,
+    pub magic: u64,
+    pub ptrtbl: ZapTablePhys,
+    pub freeblk: u64,
+    pub num_leafs: u64,
+    pub num_entries: u64,
+    pub salt: u64,
     //leafs: [u64; 8192],
-    leafs: Vec<u64>,
+    pub leafs: Vec<u64>,
 }
 
 impl fmt::Debug for ZapPhys {
@@ -1231,13 +1275,13 @@ impl ZapPhys {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZapTablePhys {
-    blk: u64, // pointer to first block of pointer table, block ID pointer
-    numblks: u64,
-    shift: u64,
-    nextblk: u64,
-    blk_copied: u64,
+    pub blk: u64, // pointer to first block of pointer table, block ID pointer
+    pub numblks: u64,
+    pub shift: u64,
+    pub nextblk: u64,
+    pub blk_copied: u64,
 }
 
 impl ZapTablePhys {
@@ -1285,13 +1329,13 @@ fn leaf_idx(hash: u64, entry_shift: u32, prefix_len: u16) -> u64 {
     shifted & ((1 << entry_shift) - 1) // mask the high bits we don't want
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZapLeafPhys {
-    hdr: ZapLeafHeader,
+    pub hdr: ZapLeafHeader,
     //hash: [u16; ZAP_LEAF_HASH_NUMENTRIES],
-    hash: Vec<u16>,
+    pub hash: Vec<u16>,
     //chunks: [ZapLeafChunk; ZAP_LEAF_NUMCHUNKS]
-    chunks: Vec<ZapLeafChunk>,
+    pub chunks: Vec<ZapLeafChunk>,
 }
 
 impl ZapLeafPhys {
@@ -1359,17 +1403,17 @@ impl ZapLeafPhys {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZapLeafHeader {
-    block_type: u64,
-    next: u64,
-    prefix: u64,
-    magic: u32,
-    nfree: u16,
-    nentries: u16,
-    prefix_len: u16,
-    freelist: u16,
-    flags: u8,
+    pub block_type: u64,
+    pub next: u64,
+    pub prefix: u64,
+    pub magic: u32,
+    pub nfree: u16,
+    pub nentries: u16,
+    pub prefix_len: u16,
+    pub freelist: u16,
+    pub flags: u8,
 }
 
 impl ZapLeafHeader {
@@ -1410,7 +1454,7 @@ const ZAP_LEAF_ENTRY: u8 = 252;
 const ZAP_LEAF_ARRAY: u8 = 251;
 const ZAP_LEAF_FREE: u8 = 253;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ZapLeafChunk {
     Entry(ZapLeafEntry),
     Array(ZapLeafArray),
@@ -1437,17 +1481,17 @@ impl ZapLeafChunk {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZapLeafEntry {
-    kind: u8,
-    int_size: u8,
-    next: u16,
-    name_chunk: u16,
-    name_length: u16,
-    value_chunk: u16,
-    value_length: u16,
-    cd: u16,
-    hash: u64,
+    pub kind: u8,
+    pub int_size: u8,
+    pub next: u16,
+    pub name_chunk: u16,
+    pub name_length: u16,
+    pub value_chunk: u16,
+    pub value_length: u16,
+    pub cd: u16,
+    pub hash: u64,
 }
 
 impl ZapLeafEntry {
@@ -1495,11 +1539,11 @@ impl ZapLeafEntry {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZapLeafArray {
-    kind: u8,
-    array: [u8; ZAP_LEAF_ARRAY_BYTES],
-    next: u16,
+    pub kind: u8,
+    pub array: [u8; ZAP_LEAF_ARRAY_BYTES],
+    pub next: u16,
 }
 
 impl ZapLeafArray {
@@ -1520,10 +1564,10 @@ impl ZapLeafArray {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZapLeafFree {
-    kind: u8,
-    next: u16,
+    pub kind: u8,
+    pub next: u16,
 }
 
 impl ZapLeafFree {
@@ -1550,22 +1594,22 @@ fn zap_hash(salt: u64, key: &[u8]) -> u64 {
     crc64::update(salt, &table, key, &CalcType::Reverse)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZNodePhys {
-    atime: [u64; 2],
-    mtime: [u64; 2],
-    ctime: [u64; 2],
-    crtime: [u64; 2],
-    gen: u64,
-    mode: u64,
-    parent: u64,
-    links: u64,
-    xattr: u64,
-    rdev: u64,
-    flags: u64,
-    uid: u64,
-    gid: u64,
-    acl: ZNodeAcl,
+    pub atime: [u64; 2],
+    pub mtime: [u64; 2],
+    pub ctime: [u64; 2],
+    pub crtime: [u64; 2],
+    pub gen: u64,
+    pub mode: u64,
+    pub parent: u64,
+    pub links: u64,
+    pub xattr: u64,
+    pub rdev: u64,
+    pub flags: u64,
+    pub uid: u64,
+    pub gid: u64,
+    pub acl: ZNodeAcl,
 }
 
 impl ZNodePhys {
@@ -1638,12 +1682,12 @@ impl ZNodePhys {
 
 pub const ACE_SLOT_CNT: usize = 6;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZNodeAcl {
-    extern_obj: u64,
-    count: u32,
-    version: u16,
-    ace_data: [Ace; ACE_SLOT_CNT],
+    pub extern_obj: u64,
+    pub count: u32,
+    pub version: u16,
+    pub ace_data: [Ace; ACE_SLOT_CNT],
 }
 
 impl ZNodeAcl {
@@ -1670,10 +1714,10 @@ impl ZNodeAcl {
 
 #[derive(Debug, Clone)]
 pub struct Ace {
-    who: u64,
-    access_mask: u32,
-    flags: u16,
-    kind: u16,
+    pub who: u64,
+    pub access_mask: u32,
+    pub flags: u16,
+    pub kind: u16,
 }
 
 impl Ace {
@@ -1696,11 +1740,11 @@ impl Ace {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZilTrailer {
-    next_blk: BlockPtr,
-    nused: u64,
-    bt: ZioBlockTail,
+    pub next_blk: BlockPtr,
+    pub nused: u64,
+    pub bt: ZioBlockTail,
 }
 
 impl ZilTrailer {
@@ -1718,12 +1762,12 @@ impl ZilTrailer {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZilLogRecord {
-    txtype: u64,
-    reclen: u64,
-    txg: u64,
-    seq: u64,
+    pub txtype: u64,
+    pub reclen: u64,
+    pub txg: u64,
+    pub seq: u64,
 }
 
 impl ZilLogRecord {
