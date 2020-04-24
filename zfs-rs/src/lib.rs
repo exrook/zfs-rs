@@ -6,7 +6,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::Error as IoError;
 use std::io::Result as IoResult;
-use std::os::unix::fs::FileExt;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use thiserror::Error;
@@ -36,7 +36,8 @@ impl Disk {
     }
     pub fn read(&self, address: u64, len: u64) -> IoResult<Vec<u8>> {
         let mut buf = vec![0; len as usize];
-        self.file.read_exact_at(&mut buf, address)?;
+        (&self.file).seek(SeekFrom::Start(address))?;
+        (&self.file).read_exact(&mut buf)?;
         Ok(buf)
     }
 }
@@ -138,11 +139,18 @@ pub trait Device {
             .iter()
             .map(|dva| {
                 let block = self.read(*dva)?;
+                let data_size = if ptr.logical_size % 2 == 1 {
+                    ptr.physical_size + 1
+                } else {
+                    ptr.physical_size
+                } as usize
+                    * 512;
+                let data = &block.as_ref()[..data_size];
                 // check checksums
                 match ptr.checksum_type {
                     ChecksumType::ZILog | ChecksumType::Fletcher2 => {
                         // fletcher2
-                        let (_input, cksum) = Fletcher2::parse(block.as_ref())?;
+                        let (_input, cksum) = Fletcher2::parse(data)?;
                         if ptr.checksum == cksum.into() {
                             Ok(())
                         } else {
@@ -151,7 +159,7 @@ pub trait Device {
                     }
                     ChecksumType::On | ChecksumType::Fletcher4 => {
                         // fletcher4
-                        let (_input, cksum) = Fletcher4::parse(block.as_ref())?;
+                        let (_input, cksum) = Fletcher4::parse(data)?;
                         if ptr.checksum == cksum.into() {
                             Ok(())
                         } else {
@@ -172,7 +180,7 @@ pub trait Device {
                 Ok(match ptr.compression_type {
                     CompressionType::Off => RawOrNah::Raw(block),
                     CompressionType::LZ4 | CompressionType::On => {
-                        RawOrNah::Nah(decompress_lz4(block.as_ref())?.1)
+                        RawOrNah::Nah(decompress_lz4(data)?.1)
                     }
                     _ => Err(ZfsErrorKind::UnsupportedFeature)?,
                 })
@@ -229,17 +237,17 @@ impl ZapResult {
     fn parse(input: &[u8], int_size: u8) -> Option<ZapResult> {
         match int_size {
             1 => Some(ZapResult::U8(input.to_owned())),
-            2 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::le_u16))(
+            2 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::be_u16))(
                 input,
             )
             .ok()
             .map(|o| ZapResult::U16(o.1)),
-            4 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::le_u32))(
+            4 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::be_u32))(
                 input,
             )
             .ok()
             .map(|o| ZapResult::U32(o.1)),
-            8 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::le_u64))(
+            8 => nom::combinator::all_consuming::<_, _, (), _>(nom::multi::many0(number::be_u64))(
                 input,
             )
             .ok()
@@ -265,7 +273,7 @@ pub trait ZFS {
         }
         let level_shift = dnode.header.indirect_block_shift - 7;
         let data_block_size = dnode.header.datablkszsec as u32 * 512;
-        let (idx, new_id) = get_block_number(block_id, dnode.header.levels, level_shift);
+        let (idx, new_id) = get_block_number(block_id, dnode.header.levels - 1, level_shift); // TODO: figure out the problem here
         self.lookup_block(
             &dnode.block_pointers[idx as usize],
             new_id,
@@ -273,6 +281,15 @@ pub trait ZFS {
             level_shift,
             data_block_size,
         )
+    }
+    fn read_dnode(&self, dnode: &DNodePhys, dnode_id: u64) -> Result<DNodePhys, ZfsError> {
+        let dnode_per_block = dnode.header.datablkszsec as u64; // dnodes are 512 bytes so this just works
+        let block_id = dnode_id / dnode_per_block;
+        let dnode_id = dnode_id % dnode_per_block;
+        let block = self.read_block(dnode, block_id)?;
+        let input = &block.as_ref()[dnode_id as usize * 512..];
+        let (_input, dnode) = DNodePhys::parse(&input)?;
+        Ok(dnode)
     }
     fn lookup_block(
         &self,
@@ -337,7 +354,7 @@ pub trait ZFS {
                 .map(|(key, val)| (key, ZapResult::U64(vec![val])))
                 .collect()),
             ZapBlock::FatHeader(zap_header) => {
-                let block_list: Vec<u64> = if zap_header.ptrtbl.blk == 0 {
+                let mut block_list: Vec<u64> = if zap_header.ptrtbl.blk == 0 {
                     zap_header
                         .leafs
                         .iter()
@@ -353,6 +370,8 @@ pub trait ZFS {
                     }
                     out
                 };
+                block_list.sort_unstable();
+                block_list.dedup();
                 let mut out = vec![];
                 for blocknum in block_list {
                     let input = self.read_block(zap_dnode, blocknum)?;
@@ -665,13 +684,10 @@ impl BlockPtr {
         let addresses = [a1, a2, a3];
         let (input, (logical_size, physical_size)) =
             nom::sequence::tuple((number::le_u16, number::le_u16))(input)?;
-        let (input, (compression_type, embedded_data)): (_, (_, u8)) = bits!(
-            input,
-            tuple!(
-                map_res!(take_bits!(7usize), TryFrom::<u8>::try_from),
-                take_bits!(1usize)
-            )
-        )?;
+        let (input, compression_type_embedded) = number::le_u8(input)?;
+        let embedded_data = compression_type_embedded & (1 << 7);
+        let compression_type =
+            CompressionType::try_from(compression_type_embedded & ((1 << 7) - 1)).unwrap();
         let embedded_data = embedded_data != 0;
         let (input, (checksum_type, kind)) =
             nom::sequence::tuple((ChecksumType::parse, number::le_u8))(input)?;
@@ -796,6 +812,7 @@ impl DNodePhysHeader {
         let (input, _pad) = nom::bytes::complete::take(4usize)(input)?;
         let (input, (max_block_id, sec_phys)) =
             nom::sequence::tuple((number::le_u64, number::le_u64))(input)?;
+        let (input, _pad) = nom::bytes::complete::take(4 * 8usize)(input)?;
         Ok((
             input,
             Self {
@@ -870,18 +887,32 @@ pub struct ZilHeader {
     pub claim_txg: u64,
     pub replay_seq: u64,
     pub log: BlockPtr,
+    pub claim_block_seq: u64,
+    pub flags: u64,
+    pub claim_lr_seq: u64,
 }
 
 impl ZilHeader {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
-        let (input, (claim_txg, replay_seq, log)) =
-            nom::sequence::tuple((number::le_u64, number::le_u64, BlockPtr::parse))(input)?;
+        let (input, (claim_txg, replay_seq, log, claim_block_seq, flags, claim_lr_seq, _pad)) =
+            nom::sequence::tuple((
+                number::le_u64,
+                number::le_u64,
+                BlockPtr::parse,
+                number::le_u64,
+                number::le_u64,
+                number::le_u64,
+                nom::bytes::complete::take(3 * 8usize),
+            ))(input)?;
         Ok((
             input,
             Self {
                 claim_txg,
                 replay_seq,
                 log,
+                claim_block_seq,
+                flags,
+                claim_lr_seq,
             },
         ))
     }
@@ -1111,7 +1142,7 @@ impl ZapBlock {
     pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
         nom::branch::alt((
             nom::combinator::map(|i| MZapPhys::parse(i, block_size), Self::MicroZap),
-            nom::combinator::map(ZapPhys::parse, Self::FatHeader),
+            nom::combinator::map(|i| ZapPhys::parse(i, block_size), Self::FatHeader),
             nom::combinator::map(|i| ZapLeafPhys::parse(i, block_size), Self::FatLeaf),
         ))(input)
     }
@@ -1244,7 +1275,7 @@ impl fmt::Debug for ZapPhys {
 }
 
 impl ZapPhys {
-    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+    pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
         let (
             input,
             (block_type, magic, ptrtbl, freeblk, num_leafs, num_entries, salt, _pad, leafs),
@@ -1256,8 +1287,8 @@ impl ZapPhys {
             number::le_u64,
             number::le_u64,
             number::le_u64,
-            nom::bytes::complete::take(8181 * 8usize),
-            nom::multi::count(number::le_u64, 8192),
+            nom::bytes::complete::take((block_size / 2) - 88),
+            nom::multi::count(number::le_u64, (block_size / 2) / 8),
         ))(input)?;
         Ok((
             input,
@@ -1315,7 +1346,7 @@ const fn ZAP_LEAF_HASH_NUMENTRIES(block_size: usize) -> usize {
 }
 
 const fn ZAP_LEAF_NUMCHUNKS(block_size: usize) -> usize {
-    (block_size - (2 * ZAP_LEAF_HASH_NUMENTRIES(block_size)) / 24) - 2
+    ((block_size - (2 * ZAP_LEAF_HASH_NUMENTRIES(block_size))) / 24) - 2
 }
 
 const ZAP_CHAIN_END: u16 = 0xffff;
@@ -1341,11 +1372,11 @@ pub struct ZapLeafPhys {
 impl ZapLeafPhys {
     /// block_size in bytes
     pub fn parse(input: &[u8], block_size: usize) -> IResult<&[u8], Self> {
-        let (input, (hdr, hash, chunks)) = nom::sequence::tuple((
-            ZapLeafHeader::parse,
-            nom::multi::count(number::le_u16, ZAP_LEAF_HASH_NUMENTRIES(block_size)),
-            nom::multi::count(ZapLeafChunk::parse, ZAP_LEAF_NUMCHUNKS(block_size)),
-        ))(input)?;
+        let (input, (hdr,)) = nom::sequence::tuple((ZapLeafHeader::parse,))(input)?;
+        let (input, hash) =
+            nom::multi::count(number::le_u16, ZAP_LEAF_HASH_NUMENTRIES(block_size))(input)?;
+        let (input, chunks) =
+            nom::multi::count(ZapLeafChunk::parse, ZAP_LEAF_NUMCHUNKS(block_size))(input)?;
         Ok((input, Self { hdr, hash, chunks }))
     }
     pub fn lookup(&self, key: &[u8], hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
@@ -1395,7 +1426,10 @@ impl ZapLeafPhys {
                 let name =
                     CString::new(self.get_array(entry.name_chunk, entry.name_length as usize - 1)?)
                         .ok()?;
-                let value = self.get_array(entry.value_chunk, entry.value_length as usize)?;
+                let value = self.get_array(
+                    entry.value_chunk,
+                    entry.int_size as usize * entry.value_length as usize,
+                )?;
                 let value = ZapResult::parse(&value, entry.int_size)?;
                 Some((name, value))
             })
