@@ -127,72 +127,83 @@ pub trait Device {
     type Block: AsRef<[u8]>;
     fn get(&self, ptr: &BlockPtr) -> Result<RawOrNah<Self::Block>, ZfsError> {
         if ptr.encryption
-            || ptr.embedded_data
             || !(ptr.compression_type == CompressionType::LZ4
                 || ptr.compression_type == CompressionType::Off
                 || ptr.compression_type == CompressionType::On)
         {
             return Err(ZfsErrorKind::UnsupportedFeature)?;
         }
-        let r: Result<Vec<ZfsError>, RawOrNah<Self::Block>> = ptr
-            .addresses
-            .iter()
-            .map(|dva| {
-                let block = self.read(*dva)?;
-                let data_size = if ptr.logical_size % 2 == 1 {
-                    ptr.physical_size + 1
-                } else {
-                    ptr.physical_size
-                } as usize
-                    * 512;
-                let data = &block.as_ref()[..data_size];
-                // check checksums
-                match ptr.checksum_type {
-                    ChecksumType::ZILog | ChecksumType::Fletcher2 => {
-                        // fletcher2
-                        let (_input, cksum) = Fletcher2::parse(data)?;
-                        if ptr.checksum == cksum.into() {
-                            Ok(())
+        match &ptr.embedded {
+            BlockPtrKind::Ptr(ptrdata) => {
+                let r: Result<Vec<ZfsError>, RawOrNah<Self::Block>> = ptrdata
+                    .addresses
+                    .iter()
+                    .map(|dva| {
+                        let block = self.read(*dva)?;
+                        let data_size = if ptr.logical_size % 2 == 1 {
+                            ptr.physical_size + 1
                         } else {
-                            Err(ZfsErrorKind::Checksum)
-                        }
-                    }
-                    ChecksumType::On | ChecksumType::Fletcher4 => {
-                        // fletcher4
-                        let (_input, cksum) = Fletcher4::parse(data)?;
-                        if ptr.checksum == cksum.into() {
-                            Ok(())
-                        } else {
-                            Err(ZfsErrorKind::Checksum)
-                        }
-                    }
-                    ChecksumType::Label | ChecksumType::GangHeader | ChecksumType::SHA256 => {
-                        // SHA256
-                        Err(ZfsErrorKind::UnsupportedFeature)
-                    }
-                    ChecksumType::Off => Ok(()), // do nothing
-                    _ => {
-                        // unsupported
-                        Err(ZfsErrorKind::UnsupportedFeature)
-                    }
-                }?;
-                // decompress
-                Ok(match ptr.compression_type {
-                    CompressionType::Off => RawOrNah::Raw(block),
-                    CompressionType::LZ4 | CompressionType::On => {
-                        RawOrNah::Nah(decompress_lz4(data)?.1)
-                    }
-                    _ => Err(ZfsErrorKind::UnsupportedFeature)?,
-                })
-            })
-            .map(|r| match r {
-                Ok(o) => Err(o),
-                Err(e) => Ok(e),
-            })
-            .collect();
-        match r.map(|mut v| v.pop().unwrap()) {
-            Ok(e) => Err(e),
-            Err(o) => Ok(o),
+                            ptr.physical_size
+                        } as usize
+                            * 512;
+                        let data_size = if data_size == 0 { 512 } else { data_size };
+                        let data = &block.as_ref()[..data_size];
+                        // check checksums
+                        match ptrdata.checksum_type {
+                            ChecksumType::ZILog | ChecksumType::Fletcher2 => {
+                                // fletcher2
+                                let (_input, cksum) = Fletcher2::parse(data)?;
+                                if ptrdata.checksum == cksum.into() {
+                                    Ok(())
+                                } else {
+                                    Err(ZfsErrorKind::Checksum)
+                                }
+                            }
+                            ChecksumType::On | ChecksumType::Fletcher4 => {
+                                // fletcher4
+                                let (_input, cksum) = Fletcher4::parse(data)?;
+                                if ptrdata.checksum == cksum.into() {
+                                    Ok(())
+                                } else {
+                                    Err(ZfsErrorKind::Checksum)
+                                }
+                            }
+                            ChecksumType::Label
+                            | ChecksumType::GangHeader
+                            | ChecksumType::SHA256 => {
+                                // SHA256
+                                Err(ZfsErrorKind::UnsupportedFeature)
+                            }
+                            ChecksumType::Off => Ok(()), // do nothing
+                            _ => {
+                                // unsupported
+                                Err(ZfsErrorKind::UnsupportedFeature)
+                            }
+                        }?;
+                        // decompress
+                        Ok(match ptr.compression_type {
+                            CompressionType::Off => RawOrNah::Raw(block),
+                            CompressionType::LZ4 | CompressionType::On => {
+                                RawOrNah::Nah(decompress_lz4(data)?.1)
+                            }
+                            _ => Err(ZfsErrorKind::UnsupportedFeature)?,
+                        })
+                    })
+                    .map(|r| match r {
+                        Ok(o) => Err(o),
+                        Err(e) => Ok(e),
+                    })
+                    .collect();
+                match r.map(|mut v| v.pop().unwrap()) {
+                    Ok(e) => Err(e),
+                    Err(o) => Ok(o),
+                }
+            }
+            BlockPtrKind::Data(block) => Ok(RawOrNah::Nah(match ptr.compression_type {
+                CompressionType::Off => block.clone(),
+                CompressionType::LZ4 | CompressionType::On => decompress_lz4(block)?.1,
+                _ => Err(ZfsErrorKind::UnsupportedFeature)?,
+            })),
         }
     }
     fn get_label(&self, label_num: u8) -> Result<Label, ZfsError>;
@@ -257,12 +268,8 @@ impl ZapResult {
     }
 }
 
-/// first tuple element is the id into the top level array, the rest is the remainder
-const fn get_block_number(id: u64, level: u8, level_shift: u8) -> (u64, u64) {
-    (
-        id >> (level as u64 * level_shift as u64),
-        id % (1 << (level as u64 * level_shift as u64)),
-    )
+const fn get_level_index(id: u64, level: u8, level_shift: u8) -> u64 {
+    id >> (level as u64 * level_shift as u64) % (1 << (level_shift as u64))
 }
 
 pub trait ZFS {
@@ -273,10 +280,10 @@ pub trait ZFS {
         }
         let level_shift = dnode.header.indirect_block_shift - 7;
         let data_block_size = dnode.header.datablkszsec as u32 * 512;
-        let (idx, new_id) = get_block_number(block_id, dnode.header.levels - 1, level_shift); // TODO: figure out the problem here
+        let idx = get_level_index(block_id, dnode.header.levels - 1, level_shift);
         self.lookup_block(
             &dnode.block_pointers[idx as usize],
-            new_id,
+            block_id,
             dnode.header.levels - 1,
             level_shift,
             data_block_size,
@@ -401,11 +408,11 @@ where
     ) -> Result<Self::Block, ZfsError> {
         let block = self.get(block)?;
         if level != 0 {
-            let (idx, new_id) = get_block_number(block_id, level, level_shift);
+            let idx = get_level_index(block_id, level - 1, level_shift);
             let (_input, block_pointer) = BlockPtr::parse(&block.as_ref()[idx as usize * 128..])?;
             self.lookup_block(
                 &block_pointer,
-                new_id,
+                block_id,
                 level - 1,
                 level_shift,
                 data_block_size,
@@ -653,23 +660,35 @@ impl ChecksumType {
     }
 }
 
+//FML
 #[derive(Debug, Clone)]
 pub struct BlockPtr {
-    pub addresses: [DVA; 3],
+    pub embedded: BlockPtrKind,
     pub byteorder: bool,
     pub dedup: bool,
     pub encryption: bool,
-    pub indirection_level: u8,
     pub kind: u8,
-    pub checksum_type: ChecksumType,
     pub compression_type: CompressionType,
     pub embedded_data: bool,
+    pub indirection_level: u8,
     pub physical_size: u16,
     pub logical_size: u16,
-    pub physical_transaction: u64,
     pub logical_transaction: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockPtrPtr {
+    pub addresses: [DVA; 3],
+    pub physical_transaction: u64,
+    pub checksum_type: ChecksumType,
     pub fill_count: u64,
     pub checksum: Checksum,
+}
+
+#[derive(Debug, Clone)]
+pub enum BlockPtrKind {
+    Ptr(BlockPtrPtr),
+    Data(Vec<u8>),
 }
 
 impl BlockPtr {
@@ -679,58 +698,131 @@ impl BlockPtr {
     }
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         use nom::{bits, map_res, take_bits, tuple};
-        let (input, (a1, a2, a3)) =
-            nom::sequence::tuple((DVA::parse, DVA::parse, DVA::parse))(input)?;
-        let addresses = [a1, a2, a3];
-        let (input, (logical_size, physical_size)) =
-            nom::sequence::tuple((number::le_u16, number::le_u16))(input)?;
-        let (input, compression_type_embedded) = number::le_u8(input)?;
-        let embedded_data = compression_type_embedded & (1 << 7);
-        let compression_type =
-            CompressionType::try_from(compression_type_embedded & ((1 << 7) - 1)).unwrap();
-        let embedded_data = embedded_data != 0;
-        let (input, (checksum_type, kind)) =
-            nom::sequence::tuple((ChecksumType::parse, number::le_u8))(input)?;
-        let (input, (indirection_level, encryption, dedup, byteorder)): (_, (_, u8, u8, u8)) = bits!(
-            input,
-            tuple!(
-                take_bits!(5usize),
-                take_bits!(1usize),
-                take_bits!(1usize),
-                take_bits!(1usize)
-            )
-        )?;
-        let encryption = encryption != 0;
-        let dedup = dedup != 0;
-        let byteorder = byteorder != 0;
-        let (input, (_pad, physical_transaction, logical_transaction, fill_count)) =
-            nom::sequence::tuple((
-                nom::bytes::complete::take(16usize),
+        let (input, (_pad, flags)) = nom::combinator::peek(nom::sequence::tuple((
+            nom::bytes::complete::take(6 * 8usize),
+            number::le_u64,
+        )))(input)?;
+        let embedded_data = (flags & (1 << 39)) != 0;
+        if embedded_data {
+            let (input, data0) = nom::bytes::complete::take(6 * 8usize)(input)?;
+            let (input, (logical_size, physical_size)) =
+                nom::sequence::tuple((number::le_u24, number::le_u8))(input)?;
+            let (input, compression_type_embedded) = number::le_u8(input)?;
+            let embedded_data = compression_type_embedded & (1 << 7);
+            let compression_type =
+                CompressionType::try_from(compression_type_embedded & ((1 << 7) - 1)).unwrap();
+            let embedded_data = embedded_data != 0;
+            let (input, (embedded_type, kind)) =
+                nom::sequence::tuple((number::le_u8, number::le_u8))(input)?;
+            let (input, level_flags) = number::le_u8(input)?;
+            let indirection_level = level_flags & ((1 << 5) - 1);
+            let encryption = level_flags & (1 << 5) != 0;
+            let dedup = level_flags & (1 << 6) != 0;
+            let byteorder = level_flags & (1 << 7) != 0;
+            //let (input, (indirection_level, encryption, dedup, byteorder)): (_, (_, u8, u8, u8)) =
+            //    bits!(
+            //        input,
+            //        tuple!(
+            //            take_bits!(5usize),
+            //            take_bits!(1usize),
+            //            take_bits!(1usize),
+            //            take_bits!(1usize)
+            //        )
+            //    )?;
+            let (input, (data1, logical_transaction, data2)) = nom::sequence::tuple((
+                nom::bytes::complete::take(3 * 8usize),
                 number::le_u64,
-                number::le_u64,
-                number::le_u64,
+                nom::bytes::complete::take(5 * 8usize),
             ))(input)?;
-        let (input, checksum) = Checksum::parse(input)?;
-        Ok((
-            input,
-            Self {
+
+            let mut data = Vec::with_capacity(data0.len() + data1.len() + data2.len());
+            data.extend(data0);
+            data.extend(data1);
+            data.extend(data2);
+
+            let embedded = BlockPtrKind::Data(data);
+            Ok((
+                input,
+                Self {
+                    embedded,
+                    byteorder,
+                    dedup,
+                    encryption,
+                    kind,
+                    compression_type,
+                    embedded_data,
+                    indirection_level,
+                    physical_size: physical_size as u16 / 512,
+                    logical_size: logical_size as u16 / 512,
+                    logical_transaction,
+                },
+            ))
+        } else {
+            let (input, (a1, a2, a3)) =
+                nom::sequence::tuple((DVA::parse, DVA::parse, DVA::parse))(input)?;
+            let addresses = [a1, a2, a3];
+            let (input, (logical_size, physical_size)) =
+                nom::sequence::tuple((number::le_u16, number::le_u16))(input)?;
+            let (input, compression_type_embedded) = number::le_u8(input)?;
+            let embedded_data = compression_type_embedded & (1 << 7);
+            let compression_type =
+                CompressionType::try_from(compression_type_embedded & ((1 << 7) - 1)).unwrap();
+            let embedded_data = embedded_data != 0;
+            let (input, (checksum_type, kind)) =
+                nom::sequence::tuple((ChecksumType::parse, number::le_u8))(input)?;
+            let (input, level_flags) = number::le_u8(input)?;
+
+            let indirection_level = level_flags & ((1 << 5) - 1);
+            let encryption = level_flags & (1 << 5) != 0;
+            let dedup = level_flags & (1 << 6) != 0;
+            let byteorder = level_flags & (1 << 7) != 0;
+
+            //let (input, (indirection_level, encryption, dedup, byteorder)): (_, (_, u8, u8, u8)) =
+            //    bits!(
+            //        input,
+            //        tuple!(
+            //            take_bits!(5usize),
+            //            take_bits!(1usize),
+            //            take_bits!(1usize),
+            //            take_bits!(1usize)
+            //        )
+            //    )?;
+
+            //let encryption = encryption != 0;
+            //let dedup = dedup != 0;
+            //let byteorder = byteorder != 0;
+            let (input, (_pad, physical_transaction, logical_transaction, fill_count)) =
+                nom::sequence::tuple((
+                    nom::bytes::complete::take(16usize),
+                    number::le_u64,
+                    number::le_u64,
+                    number::le_u64,
+                ))(input)?;
+            let (input, checksum) = Checksum::parse(input)?;
+            let embedded = BlockPtrKind::Ptr(BlockPtrPtr {
                 addresses,
-                logical_size,
-                physical_size,
-                compression_type,
-                embedded_data,
-                checksum_type,
-                kind,
-                indirection_level,
-                encryption,
-                dedup,
-                byteorder,
                 physical_transaction,
-                logical_transaction,
+                checksum_type,
                 fill_count,
                 checksum,
-            },
-        ))
+            });
+            Ok((
+                input,
+                Self {
+                    embedded,
+                    byteorder,
+                    dedup,
+                    encryption,
+                    kind,
+                    compression_type,
+                    embedded_data,
+                    indirection_level,
+                    physical_size,
+                    logical_size,
+                    logical_transaction,
+                },
+            ))
+        }
     }
 }
 
@@ -1081,7 +1173,7 @@ impl DirPhys {
                 clones,
             ),
         ) = nom::combinator::map_parser(
-            nom::bytes::complete::take(320usize),
+            nom::bytes::complete::take(256usize),
             nom::sequence::tuple((
                 number::le_u64,
                 number::le_u64,
@@ -1131,6 +1223,7 @@ const ZBT_MICRO: u64 = (1 << 63) + 3;
 const ZBT_HEADER: u64 = (1 << 63) + 1;
 const ZBT_LEAF: u64 = (1 << 63) + 0;
 
+#[derive(Debug, Clone)]
 enum ZapBlock {
     MicroZap(MZapPhys),
     FatHeader(ZapPhys),
@@ -1165,7 +1258,7 @@ impl MZapPhys {
                 nom::combinator::verify(number::le_u64, |btype| *btype == ZBT_MICRO),
                 number::le_u64,
                 number::le_u64,
-                nom::bytes::complete::take(40usize),
+                nom::bytes::complete::take(5 * 8usize),
                 nom::multi::many1(MZapEntryPhys::parse),
             )),
         )(input)?;
@@ -1184,19 +1277,29 @@ impl MZapPhys {
             // mzap strings are 50 bytes long max, including null terminators
             return None;
         }
-        let hash = zap_hash(self.salt, key);
-        let bits = (self.entries.len() + 1).trailing_zeros();
-        let mut idx = zap_hash_idx(hash, bits as u8) as usize & self.entries.len();
-        loop {
-            let entry = &self.entries[idx];
+        self.entries.iter().find_map(|entry| {
             if entry.name[0] == 0 {
                 return None;
             }
             if &entry.name[..key.len()] == key && entry.name[key.len()] == 0 {
-                return Some(entry.value);
+                Some(entry.value)
+            } else {
+                None
             }
-            idx = (idx + 1) & self.entries.len();
-        }
+        })
+        //let hash = zap_hash(self.salt, key);
+        //let bits = (self.entries.len() + 1).trailing_zeros();
+        //let mut idx = zap_hash_idx(hash, bits as u8) as usize % self.entries.len();
+        //loop {
+        //    let entry = &self.entries[idx];
+        //    if entry.name[0] == 0 {
+        //        return None;
+        //    }
+        //    if &entry.name[..key.len()] == key && entry.name[key.len()] == 0 {
+        //        return Some(entry.value);
+        //    }
+        //    idx = (idx + 1) % self.entries.len();
+        //}
     }
     pub fn get_entries(&self) -> Vec<(CString, u64)> {
         self.entries
@@ -1220,9 +1323,10 @@ pub struct MZapEntryPhys {
 
 impl MZapEntryPhys {
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
-        let (input, (value, cd, name)) = nom::sequence::tuple((
+        let (input, (value, cd, _pad, name)) = nom::sequence::tuple((
             number::le_u64,
             number::le_u32,
+            nom::bytes::complete::take(2usize),
             nom::bytes::complete::take(50usize),
         ))(input)?;
         Ok((
@@ -1382,7 +1486,11 @@ impl ZapLeafPhys {
     pub fn lookup(&self, key: &[u8], hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
         let mut leaf_idx = leaf_idx(hash, leaf_block_shift, self.hdr.prefix_len);
         loop {
-            let chunk = match &self.chunks[leaf_idx as usize] {
+            let chunk_idx = match self.hash[leaf_idx as usize] {
+                ZAP_CHAIN_END => return None,
+                i => i,
+            };
+            let chunk = match &self.chunks[chunk_idx as usize] {
                 ZapLeafChunk::Entry(e) => e,
                 _ => return None,
             };
@@ -1392,7 +1500,10 @@ impl ZapLeafPhys {
                 _ => return None,
             };
             if name == key {
-                let array = self.get_array(chunk.value_chunk, chunk.value_length as usize)?;
+                let array = self.get_array(
+                    chunk.value_chunk,
+                    chunk.int_size as usize * chunk.value_length as usize,
+                )?;
                 return ZapResult::parse(&array, chunk.int_size);
             }
             if chunk.next == ZAP_CHAIN_END {
