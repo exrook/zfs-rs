@@ -138,6 +138,7 @@ pub trait Device {
                 let r: Result<Vec<ZfsError>, RawOrNah<Self::Block>> = ptrdata
                     .addresses
                     .iter()
+                    .filter(|dva| dva.asize != 0)
                     .map(|dva| {
                         let block = self.read(*dva)?;
                         let data_size = if ptr.logical_size % 2 == 1 {
@@ -269,7 +270,7 @@ impl ZapResult {
 }
 
 const fn get_level_index(id: u64, level: u8, level_shift: u8) -> u64 {
-    id >> (level as u64 * level_shift as u64) % (1 << (level_shift as u64))
+    (id >> (level as u64 * level_shift as u64)) % (1 << (level_shift as u64))
 }
 
 pub trait ZFS {
@@ -660,7 +661,6 @@ impl ChecksumType {
     }
 }
 
-//FML
 #[derive(Debug, Clone)]
 pub struct BlockPtr {
     pub embedded: BlockPtrKind,
