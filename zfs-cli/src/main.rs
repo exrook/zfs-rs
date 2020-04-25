@@ -1,6 +1,6 @@
 use std::env::args_os;
 use std::ffi::CString;
-use zfs_rs::{DNodePhys, DatasetPhys, DirPhys, ObjsetPhys, ZNodePhys, ZapResult};
+use zfs_rs::{dmu::ObjsetPhys, dsl::DatasetPhys, dsl::DirPhys, zap::ZapResult, zpl::ZNodePhys};
 use zfs_rs::{Device, Disk, ZFS};
 
 fn main() {
