@@ -1,3 +1,6 @@
+//!
+//! Datastructures used by the ZFS Posix Layer
+//!
 use std::convert::TryInto;
 
 use nom::{number::complete as number, IResult};

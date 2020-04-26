@@ -1,3 +1,6 @@
+//!
+//! Datastructures used by the ZFS Intent Log
+//!
 use nom::{number::complete as number, IResult};
 
 use crate::spa::{BlockPtr, ZioBlockTail};

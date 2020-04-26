@@ -1,3 +1,6 @@
+//!
+//! Datastructures used by the Data Management Unit
+//!
 use std::convert::TryFrom;
 
 use nom::{number::complete as number, IResult};

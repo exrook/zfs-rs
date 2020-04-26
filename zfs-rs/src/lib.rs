@@ -1,8 +1,23 @@
+//! ZFS subsystem hierarchy
+//! ```text
+//! SPA
+//!  |
+//!  v
+//! DMU--\
+//!  | \  \
+//!  |  v  \
+//!  |  ZAP \
+//!  |  / | |
+//!  v v  v v
+//!  DSL-->ZPL
+//! ```
+
 #![feature(backtrace)]
 use std::backtrace::Backtrace;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::Error as IoError;
+use std::io::ErrorKind as IoErrorKind;
 use std::io::Result as IoResult;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -24,7 +39,7 @@ pub mod fletcher;
 use crate::compression::decompress_lz4;
 use crate::fletcher::{Fletcher2, Fletcher4};
 
-use crate::dmu::DNodePhys;
+use crate::dmu::{DNodePhys, ObjsetPhys};
 use crate::spa::{BlockPtr, BlockPtrKind, Checksum, ChecksumType, CompressionType, Label, DVA};
 use crate::zap::{
     zap_hash, zap_hash_idx, zap_leaf_hash_numentries, ZapBlock, ZapLeafPhys, ZapResult,
@@ -131,6 +146,43 @@ impl<B: AsRef<[u8]>> AsRef<[u8]> for RawOrNah<B> {
 
 pub trait Device {
     type Block: AsRef<[u8]>;
+    /// Offset and length in units of 512bytes
+    fn read_offset(&self, vdev: u32, offset: u64, length: u32) -> IoResult<Self::Block>;
+    fn get_label(&self, label_num: u8) -> Result<Option<Label>, ZfsError>;
+}
+
+impl<T, B> Device for T
+where
+    T: RawDevice<Block = B>,
+    B: AsRef<[u8]>,
+{
+    type Block = B;
+    /// Length in units of 512bytes
+    fn read_offset(&self, vdev: u32, offset: u64, length: u32) -> IoResult<Self::Block> {
+        // offset is stored in units of 512, but read_raw takes units of bytes
+        // this could overflow offset, but I don't have any 2^55 byte drives to test on
+        if vdev != 0 {
+            return Err(IoErrorKind::NotFound.into());
+        }
+        self.read_raw((offset * 512) + 0x400000, length as u64 * 512)
+    }
+    fn get_label(&self, label_num: u8) -> Result<Option<Label>, ZfsError> {
+        if label_num < 2 {
+            Ok(Some(
+                Label::parse(
+                    self.read_raw(label_num as u64 * 256 * 1024, 256 * 1024)?
+                        .as_ref(),
+                )?
+                .1,
+            ))
+        } else {
+            Err(ZfsErrorKind::UnsupportedFeature.into())
+        }
+    }
+}
+
+pub trait SPA {
+    type Block: AsRef<[u8]>;
     fn get(&self, ptr: &BlockPtr) -> Result<RawOrNah<Self::Block>, ZfsError> {
         if ptr.encryption
             || !(ptr.compression_type == CompressionType::LZ4
@@ -146,14 +198,8 @@ pub trait Device {
                     .iter()
                     .filter(|dva| dva.asize != 0)
                     .map(|dva| {
-                        let block = self.read(*dva)?;
-                        let data_size = if ptr.logical_size % 2 == 1 {
-                            ptr.physical_size + 1
-                        } else {
-                            ptr.physical_size
-                        } as usize
-                            * 512;
-                        let data_size = if data_size == 0 { 512 } else { data_size };
+                        let block = self.read(*dva, ptr.physical_size as u32 + 1)?;
+                        let data_size = (ptr.physical_size as usize + 1) * 512;
                         let data = &block.as_ref()[..data_size];
                         // check checksums
                         match ptrdata.checksum_type {
@@ -194,7 +240,7 @@ pub trait Device {
                         }?;
                         // decompress
                         Ok(match ptr.compression_type {
-                            CompressionType::Off => RawOrNah::Raw(block),
+                            CompressionType::Off => block,
                             CompressionType::LZ4 | CompressionType::On => {
                                 RawOrNah::Nah(decompress_lz4(data)?.1)
                             }
@@ -221,42 +267,72 @@ pub trait Device {
             })),
         }
     }
-    fn get_label(&self, label_num: u8) -> Result<Label, ZfsError>;
-    fn read(&self, addr: DVA) -> Result<Self::Block, ZfsError>;
-}
-
-impl<T, B: AsRef<[u8]>> Device for T
-where
-    T: RawDevice<Block = B>,
-{
-    type Block = B;
-    fn get_label(&self, label_num: u8) -> Result<Label, ZfsError> {
-        if label_num < 2 {
-            Ok(Label::parse(
-                self.read_raw(label_num as u64 * 256 * 1024, 256 * 1024)?
-                    .as_ref(),
-            )?
-            .1)
+    fn lookup_block(
+        &self,
+        block: &BlockPtr,
+        block_id: u64,
+        level: u8,
+        level_shift: u8,
+        data_block_size: u32,
+    ) -> Result<RawOrNah<Self::Block>, ZfsError> {
+        let block = self.get(block)?;
+        if level != 0 {
+            let idx = get_level_index(block_id, level - 1, level_shift);
+            let (_input, block_pointer) = BlockPtr::parse(&block.as_ref()[idx as usize * 128..])?;
+            self.lookup_block(
+                &block_pointer,
+                block_id,
+                level - 1,
+                level_shift,
+                data_block_size,
+            )
         } else {
-            Err(ZfsErrorKind::UnsupportedFeature.into())
+            Ok(block)
         }
     }
-    fn read(&self, addr: DVA) -> Result<Self::Block, ZfsError> {
+    fn read(&self, addr: DVA, psize: u32) -> Result<RawOrNah<Self::Block>, ZfsError>;
+}
+
+impl<T, B: AsRef<[u8]>> SPA for T
+where
+    T: Device<Block = B>,
+{
+    type Block = B;
+    fn read(&self, addr: DVA, psize: u32) -> Result<RawOrNah<Self::Block>, ZfsError> {
         if addr.gang {
             return Err(ZfsErrorKind::UnsupportedFeature.into());
         }
-        // offset is stored in units of 512, byte read_raw takes units of bytes
-        // this could overflow offset, but I don't have any 2^55 byte drives to test on
-        Ok(self.read_raw((addr.offset << 9) + 0x400000, (addr.asize as u64) << 9)?)
+        Ok(RawOrNah::Raw(self.read_offset(
+            addr.vdev,
+            addr.offset,
+            psize,
+        )?))
     }
+}
+
+pub trait DMU {
+    type Block: AsRef<[u8]>;
+    fn get_dnode(&self, objset: &ObjsetPhys, dnode_id: u64) -> Result<DNodePhys, ZfsError> {
+        let dnode_per_block = objset.metadnode.header.datablkszsec as u64; // dnodes are 512 bytes so this just works
+        let block_id = dnode_id / dnode_per_block;
+        let dnode_id = dnode_id % dnode_per_block;
+        let block = self.read_block(&objset.metadnode, block_id)?;
+        let input = &block.as_ref()[dnode_id as usize * 512..];
+        let (_input, dnode) = DNodePhys::parse(&input)?;
+        Ok(dnode)
+    }
+    fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError>;
 }
 
 const fn get_level_index(id: u64, level: u8, level_shift: u8) -> u64 {
     (id >> (level as u64 * level_shift as u64)) % (1 << (level_shift as u64))
 }
 
-pub trait ZFS {
-    type Block: AsRef<[u8]>;
+impl<T, B: AsRef<[u8]>> DMU for T
+where
+    T: SPA<Block = B>,
+{
+    type Block = RawOrNah<B>;
     fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError> {
         if block_id > dnode.header.max_block_id {
             return Err(ZfsErrorKind::NotFound.into());
@@ -272,24 +348,18 @@ pub trait ZFS {
             data_block_size,
         )
     }
-    fn read_dnode(&self, dnode: &DNodePhys, dnode_id: u64) -> Result<DNodePhys, ZfsError> {
-        let dnode_per_block = dnode.header.datablkszsec as u64; // dnodes are 512 bytes so this just works
-        let block_id = dnode_id / dnode_per_block;
-        let dnode_id = dnode_id % dnode_per_block;
-        let block = self.read_block(dnode, block_id)?;
-        let input = &block.as_ref()[dnode_id as usize * 512..];
-        let (_input, dnode) = DNodePhys::parse(&input)?;
-        Ok(dnode)
-    }
-    fn lookup_block(
-        &self,
-        block: &BlockPtr,
-        id: u64,
-        level: u8,
-        level_shift: u8,
-        data_block_size: u32,
-    ) -> Result<Self::Block, ZfsError>;
-    fn read_zap(&self, zap_dnode: &DNodePhys, key: &[u8]) -> Result<Option<ZapResult>, ZfsError> {
+}
+
+pub trait ZAP {
+    fn lookup_zap(&self, zap_obj: &DNodePhys, key: &CStr) -> Result<Option<ZapResult>, ZfsError>;
+    fn list_zap(&self, zap_dnode: &DNodePhys) -> Result<Vec<(CString, ZapResult)>, ZfsError>;
+}
+
+impl<T, B: AsRef<[u8]>> ZAP for T
+where
+    T: DMU<Block = B>,
+{
+    fn lookup_zap(&self, zap_dnode: &DNodePhys, key: &CStr) -> Result<Option<ZapResult>, ZfsError> {
         let input = self.read_block(zap_dnode, 0)?;
         let block_size = zap_dnode.header.datablkszsec as usize * 512;
         let leaf_block_shift = zap_leaf_hash_numentries(block_size).trailing_zeros();
@@ -297,7 +367,7 @@ pub trait ZFS {
         match zap_header {
             ZapBlock::MicroZap(micro) => Ok(micro.lookup(key).map(|k| ZapResult::U64(vec![k]))),
             ZapBlock::FatHeader(zap_header) => {
-                let hash = zap_hash(zap_header.salt, key);
+                let hash = zap_hash(zap_header.salt, key.to_bytes());
                 let idx = zap_hash_idx(hash, zap_header.ptrtbl.shift as u8);
                 let mut leaf_block_num = match if zap_header.ptrtbl.blk == 0 {
                     // use embedded pointer table
@@ -333,7 +403,7 @@ pub trait ZFS {
             ZapBlock::FatLeaf(_) => Err(ZfsErrorKind::Invalid.into()),
         }
     }
-    fn zap_entries(&self, zap_dnode: &DNodePhys) -> Result<Vec<(CString, ZapResult)>, ZfsError> {
+    fn list_zap(&self, zap_dnode: &DNodePhys) -> Result<Vec<(CString, ZapResult)>, ZfsError> {
         let input = self.read_block(zap_dnode, 0)?;
         let block_size = zap_dnode.header.datablkszsec as usize * 512;
         let (_input, zap_header) = ZapBlock::parse(input.as_ref(), block_size)?;
@@ -371,37 +441,6 @@ pub trait ZFS {
                 Ok(out)
             }
             ZapBlock::FatLeaf(_) => Err(ZfsErrorKind::Invalid.into()),
-        }
-    }
-}
-
-impl<T, B> ZFS for T
-where
-    T: Device<Block = B>,
-    B: AsRef<[u8]>,
-{
-    type Block = RawOrNah<B>;
-    fn lookup_block(
-        &self,
-        block: &BlockPtr,
-        block_id: u64,
-        level: u8,
-        level_shift: u8,
-        data_block_size: u32,
-    ) -> Result<Self::Block, ZfsError> {
-        let block = self.get(block)?;
-        if level != 0 {
-            let idx = get_level_index(block_id, level - 1, level_shift);
-            let (_input, block_pointer) = BlockPtr::parse(&block.as_ref()[idx as usize * 128..])?;
-            self.lookup_block(
-                &block_pointer,
-                block_id,
-                level - 1,
-                level_shift,
-                data_block_size,
-            )
-        } else {
-            Ok(block)
         }
     }
 }

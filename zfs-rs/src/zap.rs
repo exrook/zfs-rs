@@ -1,5 +1,8 @@
+//!
+//! Datastructures used by the ZFS Attribute Processor
+//!
 use std::convert::TryFrom;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fmt;
 
 use nom::{number::complete as number, IResult};
@@ -92,8 +95,9 @@ impl MZapPhys {
             },
         ))
     }
-    pub fn lookup(&self, key: &[u8]) -> Option<u64> {
-        if key.len() >= 50 {
+    pub fn lookup(&self, key: &CStr) -> Option<u64> {
+        let key_bytes = key.to_bytes();
+        if key_bytes.len() >= 50 {
             // mzap strings are 50 bytes long max, including null terminators
             return None;
         }
@@ -101,7 +105,7 @@ impl MZapPhys {
             if entry.name[0] == 0 {
                 return None;
             }
-            if &entry.name[..key.len()] == key && entry.name[key.len()] == 0 {
+            if &entry.name[..key_bytes.len()] == key_bytes && entry.name[key_bytes.len()] == 0 {
                 Some(entry.value)
             } else {
                 None
@@ -301,7 +305,7 @@ impl ZapLeafPhys {
             nom::multi::count(ZapLeafChunk::parse, zap_leaf_numchunks(block_size))(input)?;
         Ok((input, Self { hdr, hash, chunks }))
     }
-    pub fn lookup(&self, key: &[u8], hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
+    pub fn lookup(&self, key: &CStr, hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
         let mut leaf_idx = leaf_idx(hash, leaf_block_shift, self.hdr.prefix_len);
         loop {
             let chunk_idx = match self.hash[leaf_idx as usize] {
@@ -317,7 +321,7 @@ impl ZapLeafPhys {
                 Some(a) => a,
                 _ => return None,
             };
-            if name == key {
+            if name == key.to_bytes() {
                 let array = self.get_array(
                     chunk.value_chunk,
                     chunk.int_size as usize * chunk.value_length as usize,

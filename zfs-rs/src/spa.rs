@@ -1,3 +1,6 @@
+//!
+//! Datastructures used by the Storage Pool Alocator
+//!
 use std::convert::TryFrom;
 use std::fmt;
 

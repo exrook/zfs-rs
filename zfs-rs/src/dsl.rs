@@ -1,3 +1,6 @@
+//!
+//! Datastructures used by the Dataset and Snapshot Layer
+//!
 use nom::{number::complete as number, IResult};
 
 use crate::spa::BlockPtr;
