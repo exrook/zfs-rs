@@ -150,3 +150,14 @@ impl Ace {
         ))
     }
 }
+
+pub struct DirEntry(pub u64);
+
+impl DirEntry {
+    pub fn get_type(&self) -> u64 {
+        self.0 >> 60
+    }
+    pub fn get_objnum(&self) -> u64 {
+        self.0 & ((1 << 48) - 1)
+    }
+}

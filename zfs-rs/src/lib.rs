@@ -40,10 +40,12 @@ use crate::compression::decompress_lz4;
 use crate::fletcher::{Fletcher2, Fletcher4};
 
 use crate::dmu::{DNodePhys, ObjsetPhys};
+use crate::dsl::{DatasetPhys, DirPhys};
 use crate::spa::{BlockPtr, BlockPtrKind, Checksum, ChecksumType, CompressionType, Label, DVA};
 use crate::zap::{
     zap_hash, zap_hash_idx, zap_leaf_hash_numentries, ZapBlock, ZapLeafPhys, ZapResult,
 };
+use crate::zpl::DirEntry;
 
 #[derive(Debug)]
 pub struct Disk {
@@ -312,6 +314,7 @@ where
 
 pub trait DMU {
     type Block: AsRef<[u8]>;
+    fn get_objset(&self, ptr: &BlockPtr) -> Result<ObjsetPhys, ZfsError>;
     fn get_dnode(&self, objset: &ObjsetPhys, dnode_id: u64) -> Result<DNodePhys, ZfsError> {
         let dnode_per_block = objset.metadnode.header.datablkszsec as u64; // dnodes are 512 bytes so this just works
         let block_id = dnode_id / dnode_per_block;
@@ -333,6 +336,9 @@ where
     T: SPA<Block = B>,
 {
     type Block = RawOrNah<B>;
+    fn get_objset(&self, ptr: &BlockPtr) -> Result<ObjsetPhys, ZfsError> {
+        Ok(ObjsetPhys::parse(self.get(ptr)?.as_ref())?.1)
+    }
     fn read_block(&self, dnode: &DNodePhys, block_id: u64) -> Result<Self::Block, ZfsError> {
         if block_id > dnode.header.max_block_id {
             return Err(ZfsErrorKind::NotFound.into());
@@ -442,5 +448,73 @@ where
             }
             ZapBlock::FatLeaf(_) => Err(ZfsErrorKind::Invalid.into()),
         }
+    }
+}
+
+pub trait DSL {
+    fn get_dir(&self, objset: &ObjsetPhys, dir_id: u64) -> Result<DirPhys, ZfsError>;
+    fn get_dataset(&self, objset: &ObjsetPhys, ds_id: u64) -> Result<DatasetPhys, ZfsError>;
+}
+
+impl<B, T> DSL for T
+where
+    T: DMU<Block = B> + ZAP,
+    B: AsRef<[u8]>,
+{
+    fn get_dir(&self, objset: &ObjsetPhys, dir_id: u64) -> Result<DirPhys, ZfsError> {
+        let dnode = self.get_dnode(objset, dir_id)?;
+        Ok(DirPhys::parse(&dnode.bonus)?.1)
+    }
+    fn get_dataset(&self, objset: &ObjsetPhys, ds_id: u64) -> Result<DatasetPhys, ZfsError> {
+        let dnode = self.get_dnode(objset, ds_id)?;
+        Ok(DatasetPhys::parse(&dnode.bonus)?.1)
+    }
+}
+
+pub trait ZPL {
+    fn lookup_dir_entry(
+        &self,
+        filesystem: &ObjsetPhys,
+        dir_id: u64,
+        key: &CStr,
+    ) -> Result<Option<DirEntry>, ZfsError>;
+    fn list_dir_entries(
+        &self,
+        filesystem: &ObjsetPhys,
+        dir_id: u64,
+    ) -> Result<Vec<(CString, DirEntry)>, ZfsError>;
+}
+
+impl<B, T> ZPL for T
+where
+    T: DMU<Block = B> + ZAP,
+    B: AsRef<[u8]>,
+{
+    fn lookup_dir_entry(
+        &self,
+        filesystem: &ObjsetPhys,
+        dir_id: u64,
+        key: &CStr,
+    ) -> Result<Option<DirEntry>, ZfsError> {
+        let dir = self.get_dnode(filesystem, dir_id)?;
+        match self.lookup_zap(&dir, key)? {
+            Some(ZapResult::U64(r)) if r.len() == 1 => Ok(Some(DirEntry(r[0]))),
+            _ => Ok(None),
+        }
+    }
+    fn list_dir_entries(
+        &self,
+        filesystem: &ObjsetPhys,
+        dir_id: u64,
+    ) -> Result<Vec<(CString, DirEntry)>, ZfsError> {
+        let dir = self.get_dnode(filesystem, dir_id)?;
+        let entries = self.list_zap(&dir)?;
+        Ok(entries
+            .into_iter()
+            .filter_map(|(name, e)| match e {
+                ZapResult::U64(r) if r.len() == 0 => Some((name, DirEntry(r[0]))),
+                _ => None,
+            })
+            .collect())
     }
 }
