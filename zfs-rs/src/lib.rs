@@ -14,7 +14,6 @@
 
 #![feature(backtrace)]
 use std::backtrace::Backtrace;
-use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::Error as IoError;
 use std::io::ErrorKind as IoErrorKind;
@@ -41,9 +40,10 @@ use crate::fletcher::{Fletcher2, Fletcher4};
 
 use crate::dmu::{DNodePhys, ObjsetPhys};
 use crate::dsl::{DatasetPhys, DirPhys};
-use crate::spa::{BlockPtr, BlockPtrKind, Checksum, ChecksumType, CompressionType, Label, DVA};
+use crate::spa::{BlockPtr, BlockPtrKind, ChecksumType, CompressionType, Label, DVA};
 use crate::zap::{
-    zap_hash, zap_hash_idx, zap_leaf_hash_numentries, ZapBlock, ZapLeafPhys, ZapResult,
+    zap_hash, zap_hash_idx, zap_leaf_hash_numentries, ZapBlock, ZapLeafPhys, ZapResult, ZapStr,
+    ZapString,
 };
 use crate::zpl::DirEntry;
 
@@ -220,12 +220,12 @@ pub trait SPA {
                                 if ptrdata.checksum == cksum.clone().into() {
                                     Ok(())
                                 } else {
-                                    println!("FML");
-                                    println!("{:?}", ptr);
-                                    println!("Invalid {:?}", Checksum::from(cksum));
-                                    println!("  Valid {:?}", (ptrdata.checksum));
-                                    Ok(())
-                                    //Err(ZfsErrorKind::Checksum)
+                                    //println!("FML");
+                                    //println!("{:?}", ptr);
+                                    //println!("Invalid {:?}", Checksum::from(cksum.clone()));
+                                    //println!("  Valid {:?}", (ptrdata.checksum));
+                                    //Ok(())
+                                    Err(ZfsErrorKind::Checksum)
                                 }
                             }
                             ChecksumType::Label
@@ -357,15 +357,19 @@ where
 }
 
 pub trait ZAP {
-    fn lookup_zap(&self, zap_obj: &DNodePhys, key: &CStr) -> Result<Option<ZapResult>, ZfsError>;
-    fn list_zap(&self, zap_dnode: &DNodePhys) -> Result<Vec<(CString, ZapResult)>, ZfsError>;
+    fn lookup_zap(&self, zap_obj: &DNodePhys, key: &ZapStr) -> Result<Option<ZapResult>, ZfsError>;
+    fn list_zap(&self, zap_dnode: &DNodePhys) -> Result<Vec<(ZapString, ZapResult)>, ZfsError>;
 }
 
 impl<T, B: AsRef<[u8]>> ZAP for T
 where
     T: DMU<Block = B>,
 {
-    fn lookup_zap(&self, zap_dnode: &DNodePhys, key: &CStr) -> Result<Option<ZapResult>, ZfsError> {
+    fn lookup_zap(
+        &self,
+        zap_dnode: &DNodePhys,
+        key: &ZapStr,
+    ) -> Result<Option<ZapResult>, ZfsError> {
         let input = self.read_block(zap_dnode, 0)?;
         let block_size = zap_dnode.header.datablkszsec as usize * 512;
         let leaf_block_shift = zap_leaf_hash_numentries(block_size).trailing_zeros();
@@ -373,7 +377,7 @@ where
         match zap_header {
             ZapBlock::MicroZap(micro) => Ok(micro.lookup(key).map(|k| ZapResult::U64(vec![k]))),
             ZapBlock::FatHeader(zap_header) => {
-                let hash = zap_hash(zap_header.salt, key.to_bytes());
+                let hash = zap_hash(zap_header.salt, key);
                 let idx = zap_hash_idx(hash, zap_header.ptrtbl.shift as u8);
                 let mut leaf_block_num = match if zap_header.ptrtbl.blk == 0 {
                     // use embedded pointer table
@@ -409,7 +413,7 @@ where
             ZapBlock::FatLeaf(_) => Err(ZfsErrorKind::Invalid.into()),
         }
     }
-    fn list_zap(&self, zap_dnode: &DNodePhys) -> Result<Vec<(CString, ZapResult)>, ZfsError> {
+    fn list_zap(&self, zap_dnode: &DNodePhys) -> Result<Vec<(ZapString, ZapResult)>, ZfsError> {
         let input = self.read_block(zap_dnode, 0)?;
         let block_size = zap_dnode.header.datablkszsec as usize * 512;
         let (_input, zap_header) = ZapBlock::parse(input.as_ref(), block_size)?;
@@ -476,13 +480,13 @@ pub trait ZPL {
         &self,
         filesystem: &ObjsetPhys,
         dir_id: u64,
-        key: &CStr,
+        key: &ZapStr,
     ) -> Result<Option<DirEntry>, ZfsError>;
     fn list_dir_entries(
         &self,
         filesystem: &ObjsetPhys,
         dir_id: u64,
-    ) -> Result<Vec<(CString, DirEntry)>, ZfsError>;
+    ) -> Result<Vec<(ZapString, DirEntry)>, ZfsError>;
 }
 
 impl<B, T> ZPL for T
@@ -494,7 +498,7 @@ where
         &self,
         filesystem: &ObjsetPhys,
         dir_id: u64,
-        key: &CStr,
+        key: &ZapStr,
     ) -> Result<Option<DirEntry>, ZfsError> {
         let dir = self.get_dnode(filesystem, dir_id)?;
         match self.lookup_zap(&dir, key)? {
@@ -506,13 +510,13 @@ where
         &self,
         filesystem: &ObjsetPhys,
         dir_id: u64,
-    ) -> Result<Vec<(CString, DirEntry)>, ZfsError> {
+    ) -> Result<Vec<(ZapString, DirEntry)>, ZfsError> {
         let dir = self.get_dnode(filesystem, dir_id)?;
         let entries = self.list_zap(&dir)?;
         Ok(entries
             .into_iter()
             .filter_map(|(name, e)| match e {
-                ZapResult::U64(r) if r.len() == 0 => Some((name, DirEntry(r[0]))),
+                ZapResult::U64(r) if r.len() == 1 => Some((name, DirEntry(r[0]))),
                 _ => None,
             })
             .collect())

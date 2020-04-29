@@ -1,9 +1,11 @@
 //!
 //! Datastructures used by the ZFS Posix Layer
 //!
-use std::convert::TryInto;
+use std::convert::{TryFrom, TryInto};
 
 use nom::{number::complete as number, IResult};
+
+use enum_repr_derive::TryFrom;
 
 #[derive(Debug, Clone)]
 pub struct ZNodePhys {
@@ -151,13 +153,96 @@ impl Ace {
     }
 }
 
+#[derive(Debug)]
 pub struct DirEntry(pub u64);
 
 impl DirEntry {
-    pub fn get_type(&self) -> u64 {
-        self.0 >> 60
+    pub fn get_type(&self) -> DirEntryType {
+        let ty = (self.0 >> 60) as u8;
+        DirEntryTypeInternal::try_from(ty)
+            .map(|ty| ty.into())
+            .unwrap_or_else(|_| DirEntryType::Invalid(ty))
     }
     pub fn get_objnum(&self) -> u64 {
         self.0 & ((1 << 48) - 1)
     }
+    pub fn new(kind: DirEntryType, obj_num: u64) -> Self {
+        let ty: u8 = kind.into();
+        Self(((ty as u64) << 60) | (obj_num & ((1 << 48) - 1)))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DirEntryType {
+    NotSpecified,
+    FIFO,
+    CharacterDevice,
+    Directory,
+    BlockDevice,
+    RegularFile,
+    SymLink,
+    Socket,
+    Door,
+    EventPort,
+    Invalid(u8),
+}
+
+impl From<DirEntryTypeInternal> for DirEntryType {
+    fn from(i: DirEntryTypeInternal) -> Self {
+        use DirEntryType::*;
+        use DirEntryTypeInternal as DI;
+        match i {
+            DI::NotSpecified => NotSpecified,
+            DI::FIFO => FIFO,
+            DI::CharacterDevice => CharacterDevice,
+            DI::Directory => Directory,
+            DI::BlockDevice => BlockDevice,
+            DI::RegularFile => RegularFile,
+            DI::SymLink => SymLink,
+            DI::Socket => Socket,
+            DI::Door => Door,
+            DI::EventPort => EventPort,
+        }
+    }
+}
+
+impl Into<u8> for DirEntryType {
+    fn into(self) -> u8 {
+        use DirEntryType::*;
+        match self {
+            NotSpecified => 0,
+            FIFO => 1,
+            CharacterDevice => 2,
+            Directory => 4,
+            BlockDevice => 6,
+            RegularFile => 8,
+            SymLink => 10,
+            Socket => 12,
+            Door => 13,
+            EventPort => 14,
+            Invalid(i) => i,
+        }
+    }
+}
+
+#[derive(TryFrom)]
+#[repr(u8)]
+enum DirEntryTypeInternal {
+    NotSpecified = 0,
+    FIFO = 1,
+    CharacterDevice = 2,
+    // invalid
+    Directory = 4,
+    // invalid
+    BlockDevice = 6,
+    // invalid
+    RegularFile = 8,
+    // invalid
+    SymLink = 10,
+    // invalid
+    Socket = 12,
+    // invalid
+    Door = 13,
+    EventPort = 14,
+    // invalid
 }

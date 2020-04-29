@@ -2,13 +2,109 @@
 //! Datastructures used by the ZFS Attribute Processor
 //!
 use std::convert::TryFrom;
-use std::ffi::{CStr, CString};
 use std::fmt;
+use std::iter::FromIterator;
+use std::num::NonZeroU8;
+use std::ops::{Deref, DerefMut};
 
 use nom::{number::complete as number, IResult};
 
 use crc::crc64;
 use crc::CalcType;
+
+pub struct ZapString(Vec<MyNonZeroU8>);
+impl FromIterator<MyNonZeroU8> for ZapString {
+    fn from_iter<I: IntoIterator<Item = MyNonZeroU8>>(iter: I) -> Self {
+        Self(Vec::from_iter(iter))
+    }
+}
+
+impl ZapString {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+    pub fn with_capacity(cap: usize) -> Self {
+        Self(Vec::with_capacity(cap))
+    }
+    pub fn from_byte_slice(slice: &[u8]) -> Option<Self> {
+        slice
+            .iter()
+            .map(|x| Some(MyNonZeroU8(NonZeroU8::new(*x)?)))
+            .collect()
+    }
+    pub fn from_null_terminated(slice: &[u8]) -> Self {
+        slice
+            .iter()
+            .map(|x| Some(MyNonZeroU8(NonZeroU8::new(*x)?)))
+            .take_while(|x| x.is_some())
+            .flat_map(|x| x)
+            .collect()
+    }
+}
+
+impl fmt::Debug for ZapString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = String::from_utf8_lossy(self.0[..].as_byte_slice());
+        fmt::Debug::fmt(&s, f)
+    }
+}
+
+impl From<Vec<MyNonZeroU8>> for ZapString {
+    fn from(v: Vec<MyNonZeroU8>) -> Self {
+        Self(v)
+    }
+}
+
+impl Into<Vec<MyNonZeroU8>> for ZapString {
+    fn into(self) -> Vec<MyNonZeroU8> {
+        self.0
+    }
+}
+
+impl Deref for ZapString {
+    type Target = Vec<MyNonZeroU8>;
+    fn deref(&self) -> &Vec<MyNonZeroU8> {
+        &self.0
+    }
+}
+
+impl DerefMut for ZapString {
+    fn deref_mut(&mut self) -> &mut Vec<MyNonZeroU8> {
+        &mut self.0
+    }
+}
+
+pub type ZapStr = [MyNonZeroU8];
+
+#[derive(Clone, Copy, Eq, PartialEq, Debug, Ord, PartialOrd)]
+#[repr(transparent)]
+pub struct MyNonZeroU8(NonZeroU8);
+
+impl PartialEq<u8> for MyNonZeroU8 {
+    fn eq(&self, other: &u8) -> bool {
+        self.0.get().eq(other)
+    }
+}
+
+impl PartialEq<MyNonZeroU8> for u8 {
+    fn eq(&self, other: &MyNonZeroU8) -> bool {
+        self.eq(&other.0.get())
+    }
+}
+
+pub trait ToByteSlice {
+    fn as_byte_slice(&self) -> &[u8];
+}
+
+impl ToByteSlice for [MyNonZeroU8] {
+    fn as_byte_slice(&self) -> &[u8] {
+        cast_nonzero_u8(self)
+    }
+}
+
+fn cast_nonzero_u8<'a>(input: &'a [MyNonZeroU8]) -> &'a [u8] {
+    unsafe { &*(input as *const [MyNonZeroU8] as *const [u8]) }
+}
 
 #[derive(Debug, Clone)]
 pub enum ZapResult {
@@ -95,9 +191,8 @@ impl MZapPhys {
             },
         ))
     }
-    pub fn lookup(&self, key: &CStr) -> Option<u64> {
-        let key_bytes = key.to_bytes();
-        if key_bytes.len() >= 50 {
+    pub fn lookup(&self, key: &ZapStr) -> Option<u64> {
+        if key.len() >= 50 {
             // mzap strings are 50 bytes long max, including null terminators
             return None;
         }
@@ -105,7 +200,7 @@ impl MZapPhys {
             if entry.name[0] == 0 {
                 return None;
             }
-            if &entry.name[..key_bytes.len()] == key_bytes && entry.name[key_bytes.len()] == 0 {
+            if &entry.name[..key.len()] == key && entry.name[key.len()] == 0 {
                 Some(entry.value)
             } else {
                 None
@@ -125,14 +220,11 @@ impl MZapPhys {
         //    idx = (idx + 1) % self.entries.len();
         //}
     }
-    pub fn get_entries(&self) -> Vec<(CString, u64)> {
+    pub fn get_entries(&self) -> Vec<(ZapString, u64)> {
         self.entries
             .iter()
             .filter(|e| e.name[0] != 0)
-            .map(|e| {
-                let null_idx = e.name.iter().position(|c| *c == 0).unwrap_or(e.name.len());
-                (CString::new(&e.name[..null_idx]).unwrap(), e.value) // we found the null byte so this should never panic
-            })
+            .map(|e| (ZapString::from_null_terminated(&e.name), e.value))
             .collect()
     }
 }
@@ -305,7 +397,7 @@ impl ZapLeafPhys {
             nom::multi::count(ZapLeafChunk::parse, zap_leaf_numchunks(block_size))(input)?;
         Ok((input, Self { hdr, hash, chunks }))
     }
-    pub fn lookup(&self, key: &CStr, hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
+    pub fn lookup(&self, key: &ZapStr, hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
         let mut leaf_idx = leaf_idx(hash, leaf_block_shift, self.hdr.prefix_len);
         loop {
             let chunk_idx = match self.hash[leaf_idx as usize] {
@@ -321,7 +413,7 @@ impl ZapLeafPhys {
                 Some(a) => a,
                 _ => return None,
             };
-            if name == key.to_bytes() {
+            if name == key {
                 let array = self.get_array(
                     chunk.value_chunk,
                     chunk.int_size as usize * chunk.value_length as usize,
@@ -350,15 +442,36 @@ impl ZapLeafPhys {
             }
         }
     }
-    pub fn get_entries(&self) -> Vec<(CString, ZapResult)> {
+    fn get_name(&self, mut array_idx: u16, length: usize) -> Option<ZapString> {
+        let mut out = ZapString::with_capacity(length);
+        loop {
+            let a = match &self.chunks[array_idx as usize] {
+                ZapLeafChunk::Array(a) => a,
+                _ => return None,
+            };
+            let res = ZapString::from_null_terminated(&a.array);
+            let len = res.len();
+            (*out).extend::<Vec<MyNonZeroU8>>(res.into());
+            if len != a.array.len() {
+                return Some(out);
+            } else {
+                if a.next == ZAP_CHAIN_END {
+                    out.truncate(length);
+                    return Some(out);
+                } else {
+                    array_idx = a.next
+                }
+            }
+        }
+    }
+    pub fn get_entries(&self) -> Vec<(ZapString, ZapResult)> {
         self.chunks
             .iter()
             .filter_map(ZapLeafChunk::entry_ref)
             .filter_map(|entry| {
                 // exclude the terminating null
-                let name =
-                    CString::new(self.get_array(entry.name_chunk, entry.name_length as usize - 1)?)
-                        .ok()?;
+                let name = self.get_name(entry.name_chunk, entry.name_length as usize - 1)?;
+
                 let value = self.get_array(
                     entry.value_chunk,
                     entry.int_size as usize * entry.value_length as usize,
@@ -556,7 +669,7 @@ pub fn zap_hash_idx(hash: u64, shift: u8) -> u64 {
     }
 }
 
-pub fn zap_hash(salt: u64, key: &[u8]) -> u64 {
+pub fn zap_hash(salt: u64, key: &[MyNonZeroU8]) -> u64 {
     let table = crc64::make_table(crc64::ECMA, true);
-    crc64::update(salt, &table, key, &CalcType::Reverse)
+    crc64::update(salt, &table, key.as_byte_slice(), &CalcType::Reverse)
 }
