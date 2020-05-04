@@ -119,7 +119,7 @@ impl ObjsetPhys {
     }
 }
 
-#[derive(Debug, Clone, TryFrom)]
+#[derive(Debug, Clone, TryFrom, PartialEq, Eq)]
 #[repr(u64)]
 pub enum OsType {
     NONE = 0,

@@ -45,7 +45,7 @@ use crate::zap::{
     zap_hash, zap_hash_idx, zap_leaf_hash_numentries, ZapBlock, ZapLeafPhys, ZapResult, ZapStr,
     ZapString,
 };
-use crate::zpl::DirEntry;
+use crate::zpl::{DirEntry, DirEntryType};
 
 #[derive(Debug)]
 pub struct Disk {
@@ -476,43 +476,27 @@ where
 }
 
 pub trait ZPL {
-    fn lookup_dir_entry(
-        &self,
-        filesystem: &ObjsetPhys,
-        dir_id: u64,
-        key: &ZapStr,
-    ) -> Result<Option<DirEntry>, ZfsError>;
-    fn list_dir_entries(
-        &self,
-        filesystem: &ObjsetPhys,
-        dir_id: u64,
-    ) -> Result<Vec<(ZapString, DirEntry)>, ZfsError>;
+    fn lookup_dir_entry(&self, dir: &DNodePhys, key: &ZapStr)
+        -> Result<Option<DirEntry>, ZfsError>;
+    fn list_dir_entries(&self, dir: &DNodePhys) -> Result<Vec<(ZapString, DirEntry)>, ZfsError>;
 }
 
-impl<B, T> ZPL for T
+impl<T> ZPL for T
 where
-    T: DMU<Block = B> + ZAP,
-    B: AsRef<[u8]>,
+    T: ZAP,
 {
     fn lookup_dir_entry(
         &self,
-        filesystem: &ObjsetPhys,
-        dir_id: u64,
+        dir: &DNodePhys,
         key: &ZapStr,
     ) -> Result<Option<DirEntry>, ZfsError> {
-        let dir = self.get_dnode(filesystem, dir_id)?;
-        match self.lookup_zap(&dir, key)? {
+        match self.lookup_zap(dir, key)? {
             Some(ZapResult::U64(r)) if r.len() == 1 => Ok(Some(DirEntry(r[0]))),
             _ => Ok(None),
         }
     }
-    fn list_dir_entries(
-        &self,
-        filesystem: &ObjsetPhys,
-        dir_id: u64,
-    ) -> Result<Vec<(ZapString, DirEntry)>, ZfsError> {
-        let dir = self.get_dnode(filesystem, dir_id)?;
-        let entries = self.list_zap(&dir)?;
+    fn list_dir_entries(&self, dir: &DNodePhys) -> Result<Vec<(ZapString, DirEntry)>, ZfsError> {
+        let entries = self.list_zap(dir)?;
         Ok(entries
             .into_iter()
             .filter_map(|(name, e)| match e {
@@ -521,4 +505,275 @@ where
             })
             .collect())
     }
+}
+
+#[derive(Debug)]
+pub struct ZfsDrive<Z: DMU + DSL + ZPL> {
+    inner: Z,
+    label: Label,
+}
+
+impl<Z: DMU + DSL + ZPL> ZfsDrive<Z> {
+    pub fn new_with_label(inner: Z, label: Label) -> Self {
+        Self { inner, label }
+    }
+}
+
+impl<Z: DMU + DSL + ZPL + SPA> ZfsDrive<Z> {
+    pub fn get_most_recent_mos<'a>(&'a self) -> Result<ZfsMetaObjectSet<'a, Z>, ZfsError> {
+        let mut ubers = self.label.uberblocks.clone();
+        ubers.sort_unstable_by_key(|u| u.txg);
+        let uber = ubers.pop().ok_or(ZfsErrorKind::Invalid)?;
+        self.get_object_set(&uber.rootbp)?
+            .as_mos()
+            .ok_or(ZfsErrorKind::Invalid.into())
+    }
+
+    pub fn get_object_set<'drive>(
+        &'drive self,
+        ptr: &BlockPtr,
+    ) -> Result<ZfsObjectSet<'drive, Z>, ZfsError> {
+        let block = self.inner.get(ptr)?;
+        let (_input, objset) = ObjsetPhys::parse(block.as_ref())?;
+        Ok(ZfsObjectSet::new(self, objset))
+    }
+}
+
+impl<Z: DMU + DSL + ZPL + Device> ZfsDrive<Z> {
+    pub fn new(inner: Z) -> Result<Self, ZfsError> {
+        let label = inner.get_label(0)?.ok_or(ZfsErrorKind::Invalid)?; // TODO: try checking other labels
+        Ok(Self { inner, label })
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsObjectSet<'drive, Z: DMU + DSL + ZPL> {
+    drive: &'drive ZfsDrive<Z>,
+    os: ObjsetPhys,
+}
+
+impl<'drive, Z: DMU + DSL + ZPL> ZfsObjectSet<'drive, Z> {
+    pub fn new(drive: &'drive ZfsDrive<Z>, os: ObjsetPhys) -> Self {
+        Self { drive, os }
+    }
+    pub fn as_mos(self) -> Option<ZfsMetaObjectSet<'drive, Z>> {
+        if self.os.os_type == dmu::OsType::META {
+            Some(ZfsMetaObjectSet { os: self })
+        } else {
+            None
+        }
+    }
+    pub fn as_zpl(self) -> Option<ZfsZPLObjectSet<'drive, Z>> {
+        if self.os.os_type == dmu::OsType::ZFS {
+            Some(ZfsZPLObjectSet { os: self })
+        } else {
+            None
+        }
+    }
+    pub fn as_zvol(self) -> Option<ZfsZVolObjectSet<'drive, Z>> {
+        if self.os.os_type == dmu::OsType::ZFS {
+            Some(ZfsZVolObjectSet { os: self })
+        } else {
+            None
+        }
+    }
+    pub fn get_dnode(&self, obj_num: u64) -> Result<DNodePhys, ZfsError> {
+        self.drive.inner.get_dnode(&self.os, obj_num)
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsMetaObjectSet<'drive, Z: DMU + DSL + ZPL> {
+    os: ZfsObjectSet<'drive, Z>,
+}
+
+impl<'drive, Z: DMU + DSL + ZPL> ZfsMetaObjectSet<'drive, Z> {
+    pub fn get_root_dir<'mos>(&'mos self) -> Result<ZfsDslDir<'drive, 'mos, Z>, ZfsError> {
+        let mos_config = self.os.get_dnode(1)?;
+        let root_obj_num = match self
+            .os
+            .drive
+            .inner
+            .lookup_zap(
+                &mos_config,
+                &ZapString::from_byte_slice(b"root_dataset").unwrap(),
+            )?
+            .ok_or(ZfsErrorKind::NotFound)?
+        {
+            ZapResult::U64(a) if a.len() == 1 => Ok(a[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+        self.get_dsl_dir(root_obj_num)
+    }
+
+    pub fn get_dsl_dir<'mos>(
+        &'mos self,
+        obj_num: u64,
+    ) -> Result<ZfsDslDir<'drive, 'mos, Z>, ZfsError> {
+        let dir_obj = self.os.drive.inner.get_dir(&self.os.os, obj_num)?;
+        Ok(ZfsDslDir::new(self, dir_obj))
+    }
+
+    pub fn get_dsl_datset<'mos>(
+        &'mos self,
+        obj_num: u64,
+    ) -> Result<ZfsDslDataset<'drive, 'mos, Z>, ZfsError> {
+        let ds_obj = self.os.drive.inner.get_dataset(&self.os.os, obj_num)?;
+        Ok(ZfsDslDataset::new(self, ds_obj))
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsDslDir<'drive, 'mos, Z: DMU + DSL + ZPL> {
+    mos: &'mos ZfsMetaObjectSet<'drive, Z>,
+    dsl_dir: DirPhys,
+}
+
+impl<'drive, 'mos, Z: DMU + DSL + ZPL> ZfsDslDir<'drive, 'mos, Z> {
+    pub fn new(
+        mos: &'mos ZfsMetaObjectSet<'drive, Z>,
+        dsl_dir: DirPhys,
+    ) -> ZfsDslDir<'drive, 'mos, Z> {
+        Self { mos, dsl_dir }
+    }
+}
+
+impl<'drive, 'mos, Z: DMU + DSL + ZPL + ZAP> ZfsDslDir<'drive, 'mos, Z> {
+    pub fn children(&self) -> Result<Vec<(ZapString, ZfsDslDir<'drive, 'mos, Z>)>, ZfsError> {
+        let child_zap = self.mos.os.get_dnode(self.dsl_dir.child_dir_zapobj)?;
+        let children = self.mos.os.drive.inner.list_zap(&child_zap)?;
+        children
+            .into_iter()
+            .map(|(name, val)| {
+                let objnum = match val {
+                    ZapResult::U64(a) if a.len() == 1 => Ok(a[0]),
+                    _ => Err(ZfsErrorKind::Invalid),
+                }?;
+                self.mos.get_dsl_dir(objnum).map(|dir| (name, dir))
+            })
+            .collect()
+    }
+    pub fn get_child(
+        &self,
+        child: &ZapStr,
+    ) -> Result<Option<ZfsDslDir<'drive, 'mos, Z>>, ZfsError> {
+        let child_zap = self.mos.os.get_dnode(self.dsl_dir.child_dir_zapobj)?;
+        let child = match self.mos.os.drive.inner.lookup_zap(&child_zap, child)? {
+            Some(ZapResult::U64(a)) if a.len() == 1 => Ok(a[0]),
+            Some(_) => Err(ZfsErrorKind::Invalid),
+            None => return Ok(None),
+        }?;
+        self.mos.get_dsl_dir(child).map(Some)
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsDslDataset<'drive, 'mos, Z: DMU + DSL + ZPL> {
+    mos: &'mos ZfsMetaObjectSet<'drive, Z>,
+    dsl_ds: DatasetPhys,
+}
+
+impl<'drive, 'mos, Z: DMU + DSL + ZPL> ZfsDslDataset<'drive, 'mos, Z> {
+    pub fn new(
+        mos: &'mos ZfsMetaObjectSet<'drive, Z>,
+        dsl_ds: DatasetPhys,
+    ) -> ZfsDslDataset<'drive, 'mos, Z> {
+        Self { mos, dsl_ds }
+    }
+}
+
+impl<'drive, 'mos, Z: DMU + DSL + ZPL + SPA> ZfsDslDataset<'drive, 'mos, Z> {
+    pub fn get_object_set(&self) -> Result<ZfsObjectSet<'drive, Z>, ZfsError> {
+        self.mos.os.drive.get_object_set(&self.dsl_ds.bp)
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsZPLObjectSet<'drive, Z: DMU + DSL + ZPL> {
+    os: ZfsObjectSet<'drive, Z>,
+}
+
+impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
+    pub fn get_root<'fs>(&'fs self) -> Result<ZfsZPLDir<'drive, 'fs, Z>, ZfsError> {
+        let master_node = self.os.get_dnode(1)?;
+        let root_obj_num = match self
+            .os
+            .drive
+            .inner
+            .lookup_zap(&master_node, &ZapString::from_byte_slice(b"ROOT").unwrap())?
+            .ok_or(ZfsErrorKind::NotFound)?
+        {
+            ZapResult::U64(a) if a.len() == 1 => Ok(a[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+        self.get_dir(root_obj_num)
+    }
+    pub fn get_dir<'fs>(&'fs self, obj_num: u64) -> Result<ZfsZPLDir<'drive, 'fs, Z>, ZfsError> {
+        let dir_obj = self.os.get_dnode(obj_num)?;
+        Ok(ZfsZPLDir::new(self, dir_obj))
+    }
+    // TODO: remove option after implementing other object types
+    pub fn get_dir_entry<'fs>(
+        &'fs self,
+        entry: DirEntry,
+    ) -> Result<Option<ZfsDirEntry<'drive, 'fs, Z>>, ZfsError> {
+        let dnode = self.os.get_dnode(entry.get_objnum())?;
+        match entry.get_type() {
+            DirEntryType::Directory => Ok(Some(ZfsDirEntry::Dir(ZfsZPLDir::new(self, dnode)))),
+            DirEntryType::RegularFile => Ok(Some(ZfsDirEntry::File(ZfsZPLFile::new(self, dnode)))),
+            _ => Ok(None), // TODO: implement other types
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsZPLDir<'drive, 'fs, Z: DMU + DSL + ZPL> {
+    fs: &'fs ZfsZPLObjectSet<'drive, Z>,
+    dir: DNodePhys,
+}
+
+impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLDir<'drive, 'fs, Z> {
+    pub fn new(fs: &'fs ZfsZPLObjectSet<'drive, Z>, dir: DNodePhys) -> Self {
+        Self { fs, dir }
+    }
+    pub fn children(&self) -> Result<Vec<(ZapString, ZfsDirEntry<'drive, 'fs, Z>)>, ZfsError> {
+        let children = self.fs.os.drive.inner.list_dir_entries(&self.dir)?;
+        children
+            .into_iter()
+            .map(|(name, entry)| Ok(self.fs.get_dir_entry(entry)?.map(|e| (name, e))))
+            .filter_map(|r| r.transpose())
+            .collect()
+    }
+    pub fn get_child(
+        &self,
+        child: &ZapStr,
+    ) -> Result<Option<ZfsDirEntry<'drive, 'fs, Z>>, ZfsError> {
+        let child = match self.fs.os.drive.inner.lookup_dir_entry(&self.dir, child)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        self.fs.get_dir_entry(child)
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsZPLFile<'drive, 'fs, Z: DMU + DSL + ZPL> {
+    fs: &'fs ZfsZPLObjectSet<'drive, Z>,
+    file: DNodePhys,
+}
+
+impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLFile<'drive, 'fs, Z> {
+    pub fn new(fs: &'fs ZfsZPLObjectSet<'drive, Z>, file: DNodePhys) -> Self {
+        Self { fs, file }
+    }
+}
+
+pub enum ZfsDirEntry<'drive, 'fs, Z: DMU + DSL + ZPL> {
+    Dir(ZfsZPLDir<'drive, 'fs, Z>),
+    File(ZfsZPLFile<'drive, 'fs, Z>),
+}
+
+#[derive(Debug)]
+pub struct ZfsZVolObjectSet<'drive, Z: DMU + DSL + ZPL> {
+    os: ZfsObjectSet<'drive, Z>,
 }
