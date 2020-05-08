@@ -45,7 +45,7 @@ use crate::zap::{
     zap_hash, zap_hash_idx, zap_leaf_hash_numentries, ZapBlock, ZapLeafPhys, ZapResult, ZapStr,
     ZapString,
 };
-use crate::zpl::{DirEntry, DirEntryType};
+use crate::zpl::{DirEntry, DirEntryType, SAAttr, SAAttrPhys};
 
 #[derive(Debug)]
 pub struct Disk {
@@ -479,11 +479,17 @@ pub trait ZPL {
     fn lookup_dir_entry(&self, dir: &DNodePhys, key: &ZapStr)
         -> Result<Option<DirEntry>, ZfsError>;
     fn list_dir_entries(&self, dir: &DNodePhys) -> Result<Vec<(ZapString, DirEntry)>, ZfsError>;
+    fn lookup_sa_layout(
+        &self,
+        objset: &ObjsetPhys,
+        sa_root_zap: &DNodePhys,
+        layout_id: u16,
+    ) -> Result<Vec<SAAttr>, ZfsError>;
 }
 
-impl<T> ZPL for T
+impl<T, B: AsRef<[u8]>> ZPL for T
 where
-    T: ZAP,
+    T: ZAP + DMU<Block = B>,
 {
     fn lookup_dir_entry(
         &self,
@@ -505,6 +511,62 @@ where
             })
             .collect())
     }
+    fn lookup_sa_layout(
+        &self,
+        objset: &ObjsetPhys,
+        sa_root_zap: &DNodePhys,
+        layout_id: u16,
+    ) -> Result<Vec<SAAttr>, ZfsError> {
+        let registry_id = match self.lookup_zap(
+            sa_root_zap,
+            &ZapString::from_byte_slice(b"REGISTRY").unwrap(),
+        )? {
+            Some(ZapResult::U64(r)) if r.len() == 1 => Ok(r[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+
+        let layouts_id = match self.lookup_zap(
+            sa_root_zap,
+            &ZapString::from_byte_slice(b"LAYOUTS").unwrap(),
+        )? {
+            Some(ZapResult::U64(r)) if r.len() == 1 => Ok(r[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+
+        let layouts = self.get_dnode(objset, layouts_id)?;
+        let registry = self.get_dnode(objset, registry_id)?;
+        let layout = match self
+            .lookup_zap(
+                &layouts,
+                &ZapString::from_byte_slice(format!("{}", layout_id).as_bytes()).unwrap(),
+            )?
+            .ok_or(ZfsErrorKind::NotFound)?
+        {
+            ZapResult::U16(a) => Ok(a),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+        let mut registry: Vec<_> = self
+            .list_zap(&registry)?
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                ZapResult::U64(v) if v.len() == 1 => Some((SAAttrPhys(v[0]), k)),
+                _ => None,
+            })
+            .collect();
+        registry.sort_unstable_by_key(|a| a.0.get_attr_num());
+        layout
+            .into_iter()
+            .map(|id| {
+                let idx = registry
+                    .binary_search_by_key(&id, |x| x.0.get_attr_num())
+                    .map_err(|_| ZfsErrorKind::NotFound)?;
+                Ok(SAAttr::new(
+                    registry[idx].1.clone(),
+                    registry[idx].0.clone(),
+                ))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug)]
@@ -516,6 +578,9 @@ pub struct ZfsDrive<Z: DMU + DSL + ZPL> {
 impl<Z: DMU + DSL + ZPL> ZfsDrive<Z> {
     pub fn new_with_label(inner: Z, label: Label) -> Self {
         Self { inner, label }
+    }
+    pub fn inner(&self) -> &Z {
+        &self.inner
     }
 }
 

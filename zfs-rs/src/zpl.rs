@@ -7,6 +7,10 @@ use nom::{number::complete as number, IResult};
 
 use enum_repr_derive::TryFrom;
 
+use crate::zap::ZapString;
+
+/// Turns out this structure isn't used anymore since ZPL version 5
+// -_-
 #[derive(Debug, Clone)]
 pub struct ZNodePhys {
     pub atime: [u64; 2],
@@ -245,4 +249,45 @@ enum DirEntryTypeInternal {
     Door = 13,
     EventPort = 14,
     // invalid
+}
+
+#[derive(Debug)]
+pub struct SAAttr {
+    pub name: ZapString,
+    pub length: u16,
+    pub byteswap: SAByteswapType,
+}
+
+impl SAAttr {
+    pub fn new(name: ZapString, phys: SAAttrPhys) -> Self {
+        SAAttr {
+            name: name,
+            length: phys.get_len(),
+            byteswap: phys.get_byteswap().unwrap(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SAAttrPhys(pub u64);
+impl SAAttrPhys {
+    pub fn get_len(&self) -> u16 {
+        ((self.0 >> 24) & ((1 << 16) - 1)) as u16
+    }
+    pub fn get_byteswap(&self) -> Option<SAByteswapType> {
+        (((self.0 >> 16) & ((1 << 8) - 1)) as u8).try_into().ok()
+    }
+    pub fn get_attr_num(&self) -> u16 {
+        (self.0 & ((1 << 16) - 1)) as u16
+    }
+}
+
+#[derive(Debug, TryFrom)]
+#[repr(u8)]
+pub enum SAByteswapType {
+    UInt64Array = 0,
+    UInt32Array = 1,
+    UInt16Array = 2,
+    UInt8Array = 3,
+    ACL = 4,
 }

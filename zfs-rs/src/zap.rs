@@ -12,6 +12,7 @@ use nom::{number::complete as number, IResult};
 use crc::crc64;
 use crc::CalcType;
 
+#[derive(Clone)]
 pub struct ZapString(Vec<MyNonZeroU8>);
 impl FromIterator<MyNonZeroU8> for ZapString {
     fn from_iter<I: IntoIterator<Item = MyNonZeroU8>>(iter: I) -> Self {
