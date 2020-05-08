@@ -549,7 +549,7 @@ impl<Z: DMU + DSL + ZPL + Device> ZfsDrive<Z> {
 #[derive(Debug)]
 pub struct ZfsObjectSet<'drive, Z: DMU + DSL + ZPL> {
     drive: &'drive ZfsDrive<Z>,
-    os: ObjsetPhys,
+    pub os: ObjsetPhys,
 }
 
 impl<'drive, Z: DMU + DSL + ZPL> ZfsObjectSet<'drive, Z> {
@@ -614,12 +614,15 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsMetaObjectSet<'drive, Z> {
         Ok(ZfsDslDir::new(self, dir_obj))
     }
 
-    pub fn get_dsl_datset<'mos>(
+    pub fn get_dsl_dataset<'mos>(
         &'mos self,
         obj_num: u64,
     ) -> Result<ZfsDslDataset<'drive, 'mos, Z>, ZfsError> {
         let ds_obj = self.os.drive.inner.get_dataset(&self.os.os, obj_num)?;
         Ok(ZfsDslDataset::new(self, ds_obj))
+    }
+    pub fn as_os(&self) -> &ZfsObjectSet<'drive, Z> {
+        &self.os
     }
 }
 
@@ -635,6 +638,9 @@ impl<'drive, 'mos, Z: DMU + DSL + ZPL> ZfsDslDir<'drive, 'mos, Z> {
         dsl_dir: DirPhys,
     ) -> ZfsDslDir<'drive, 'mos, Z> {
         Self { mos, dsl_dir }
+    }
+    pub fn get_head_dataset(&self) -> Result<ZfsDslDataset<'drive, 'mos, Z>, ZfsError> {
+        self.mos.get_dsl_dataset(self.dsl_dir.head_dataset_obj)
     }
 }
 
@@ -724,6 +730,9 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
             _ => Ok(None), // TODO: implement other types
         }
     }
+    pub fn as_os(&self) -> &ZfsObjectSet<'drive, Z> {
+        &self.os
+    }
 }
 
 #[derive(Debug)]
@@ -768,6 +777,7 @@ impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLFile<'drive, 'fs, Z> {
     }
 }
 
+#[derive(Debug)]
 pub enum ZfsDirEntry<'drive, 'fs, Z: DMU + DSL + ZPL> {
     Dir(ZfsZPLDir<'drive, 'fs, Z>),
     File(ZfsZPLFile<'drive, 'fs, Z>),

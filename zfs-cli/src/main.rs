@@ -1,12 +1,7 @@
 use std::env::args_os;
-use std::path::{Component, Path, PathBuf};
-use zfs_rs::{
-    dmu::ObjsetPhys,
-    dsl::DirPhys,
-    zap::{ZapResult, ZapString},
-    zpl::{DirEntry, DirEntryType},
-};
-use zfs_rs::{Device, Disk, ZfsError, ZfsErrorKind, DMU, DSL, SPA, ZAP, ZPL};
+use std::path::{Component, PathBuf};
+use zfs_rs::{dsl::DirPhys, zap::ZapString};
+use zfs_rs::{Device, Disk, ZfsDirEntry, ZfsDrive, ZfsDslDir, ZfsError, ZfsErrorKind};
 
 fn main() {
     let path = args_os().nth(1).expect("First argument is required");
@@ -16,40 +11,29 @@ fn main() {
     let label = disk.get_label(0).unwrap().unwrap();
     let mut uber = label.uberblocks;
     uber.sort_unstable_by_key(|u| u.txg);
+    let drive = ZfsDrive::new(disk).unwrap();
     for u in uber.iter().rev().take(1) {
         //u.rootbp.indirection_level = 0;
         //println!("{:#?}", u);
-        let block = disk.get(&u.rootbp).unwrap();
-        let (_input, objset) = ObjsetPhys::parse(block.as_ref()).unwrap();
+        let meta_objset = drive.get_object_set(&u.rootbp).unwrap().as_mos().unwrap();
         //println!("objset: {:?}", objset);
         //
         //
-        let entry: Result<_, ZfsError> = (|| {
-            let dir = disk.get_dnode(&objset, 1)?;
-            //let mos_config = disk.list_zap(&dir)?;
-            //println!("CONFIG {:?}", mos_config);
-            match disk
-                .lookup_zap(&dir, &ZapString::from_byte_slice(b"root_dataset").unwrap())?
-                .ok_or(ZfsErrorKind::NotFound)?
-            {
-                ZapResult::U64(a) => Ok(a[0]),
-                r => panic!("Wrong ZapResult kind: {:?}", r),
-            }
-        })();
-        let entry = match entry {
+        let obj_dir = meta_objset.get_root_dir();
+        let obj_dir = match obj_dir {
             Ok(e) => e,
             Err(_) => {
                 println!("Error reading MOS ZAP object, searching for root dataset");
                 let mut entry = None;
-                for i in 0..(objset.metadnode.header.max_block_id
-                    * objset.metadnode.header.datablkszsec as u64)
+                for i in 0..(meta_objset.as_os().os.metadnode.header.max_block_id
+                    * meta_objset.as_os().os.metadnode.header.datablkszsec as u64)
                 {
-                    if let Ok(dnode) = disk.get_dnode(&objset, i) {
+                    if let Ok(dnode) = meta_objset.as_os().get_dnode(i) {
                         if dnode.header.kind == 12 {
                             if let Ok((_, dir)) = DirPhys::parse(&dnode.bonus) {
                                 if dir.parent_obj == 0 {
                                     println!("Found root dataset with object id {}", i);
-                                    entry = Some(i);
+                                    entry = Some(ZfsDslDir::new(&meta_objset, dir));
                                     break;
                                 }
                             }
@@ -60,118 +44,61 @@ fn main() {
             }
         };
 
-        let obj_dir = find_obj_dir(&disk, &objset, entry, &zfs_dataset_path)
-            .unwrap()
+        let obj_dir = zfs_dataset_path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => {
+                    ZapString::from_byte_slice(s.to_str().expect("Unicode gang ONLY").as_bytes())
+                }
+                _ => None,
+            })
+            .try_fold::<_, _, Result<_, ZfsError>>(obj_dir, |dir, path| {
+                dir.get_child(&path)?.ok_or(ZfsErrorKind::NotFound.into())
+            })
             .unwrap();
 
         match &zfs_fs_path {
             &Some(ref zfs_fs_path) => {
-                let dataset = disk.get_dataset(&objset, obj_dir.head_dataset_obj).unwrap();
-                let zpl_objset = disk.get_objset(&dataset.bp).unwrap();
-                let master_node = disk.get_dnode(&zpl_objset, 1).unwrap();
-                let root_dir_num = match disk
-                    .lookup_zap(&master_node, &ZapString::from_byte_slice(b"ROOT").unwrap())
-                    .unwrap()
-                    .unwrap()
-                {
-                    ZapResult::U64(a) if a.len() == 1 => a[0],
-                    r => panic!("Wrong ZapResult kind: {:?}", r),
-                };
-                let dirent = match zfs_fs_path.components().next_back() {
-                    Some(Component::RootDir) | Some(Component::CurDir) => {
-                        DirEntry::new(DirEntryType::Directory, root_dir_num)
-                    }
-                    _ => {
-                        let mut rest = zfs_fs_path.components();
-                        let prefix = rest.next();
-                        let path = match prefix {
-                            Some(Component::RootDir) | Some(Component::CurDir) => rest.as_path(),
-                            _ => zfs_fs_path,
-                        };
+                let dataset = obj_dir.get_head_dataset().unwrap();
+                let zpl_objset = dataset.get_object_set().unwrap().as_zpl().unwrap();
+                let root_dir = zpl_objset.get_root().unwrap();
 
-                        find_dirent(&disk, &zpl_objset, root_dir_num, path)
-                            .unwrap()
-                            .unwrap()
-                    }
-                };
-                match dirent.get_type() {
-                    DirEntryType::Directory => println!(
-                        "Drectory listing: {:?}",
-                        disk.list_dir_entries(&zpl_objset, dirent.get_objnum())
-                    ),
-                    ty => println!("Type {:?}", ty),
-                };
+                let dir = zfs_fs_path
+                    .components()
+                    .filter_map(|c| match c {
+                        Component::Normal(s) => ZapString::from_byte_slice(
+                            s.to_str().expect("Unicode gang ONLY").as_bytes(),
+                        ),
+                        _ => None,
+                    })
+                    .try_fold::<_, _, Result<_, ZfsError>>(root_dir, |dir, path| {
+                        match dir.get_child(&path)?.ok_or(ZfsErrorKind::NotFound)? {
+                            ZfsDirEntry::Dir(d) => Ok(d),
+                            _ => Err(ZfsErrorKind::NotFound.into()),
+                        }
+                    })
+                    .unwrap();
+
+                print!("Drectory listing: (");
+                for (name, e) in dir.children().unwrap() {
+                    print!(
+                        "{:?}: {},",
+                        name,
+                        match e {
+                            ZfsDirEntry::File(_) => "file",
+                            ZfsDirEntry::Dir(_) => "dir",
+                        }
+                    )
+                }
+                println!(")");
             }
             None => {
-                let child_dir = disk.get_dnode(&objset, obj_dir.child_dir_zapobj).unwrap();
-                let listing = disk.list_zap(&child_dir).unwrap();
-                println!("Object Directory listing: {:?}", listing);
+                print!("Drectory listing: (");
+                for (name, _e) in obj_dir.children().unwrap() {
+                    print!("{:?},", name,)
+                }
+                println!(")");
             }
         };
-    }
-}
-
-fn find_obj_dir<P: AsRef<Path>>(
-    disk: &Disk,
-    dsl_objset: &ObjsetPhys,
-    root_dsl_dir: u64,
-    path: P,
-) -> Result<Option<DirPhys>, ZfsError> {
-    let root_dsl_dir = disk.get_dir(dsl_objset, root_dsl_dir)?;
-    let children = disk.get_dnode(dsl_objset, root_dsl_dir.child_dir_zapobj)?;
-    let mut components = path.as_ref().components();
-    let prefix = match components.next() {
-        None | Some(Component::RootDir) => return Ok(Some(root_dsl_dir)),
-        Some(s) => s,
-    };
-    let rest = components.as_path();
-    let child = match disk.lookup_zap(
-        &children,
-        &ZapString::from_byte_slice(
-            prefix
-                .as_os_str()
-                .to_str()
-                .expect("Use unicode or perish, fool")
-                .as_bytes(),
-        )
-        .unwrap(),
-    )? {
-        Some(ZapResult::U64(u)) if u.len() == 1 => u[0],
-        _ => return Ok(None),
-    };
-    find_obj_dir(disk, dsl_objset, child, rest)
-}
-
-fn find_dirent<P: AsRef<Path>>(
-    disk: &Disk,
-    zpl_objset: &ObjsetPhys,
-    root_dir: u64,
-    path: P,
-) -> Result<Option<DirEntry>, ZfsError> {
-    let mut components = path.as_ref().components();
-    let prefix = match components.next() {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let rest = components.as_path();
-    let entry = match disk.lookup_dir_entry(
-        zpl_objset,
-        root_dir,
-        &ZapString::from_byte_slice(
-            prefix
-                .as_os_str()
-                .to_str()
-                .expect("Unicode gang ONLY")
-                .as_bytes(),
-        )
-        .unwrap(),
-    )? {
-        Some(e) => e,
-        None => return Ok(None),
-    };
-    if rest.as_os_str().len() == 0 {
-        return Ok(Some(entry));
-    } else {
-        find_dirent(disk, zpl_objset, entry.get_objnum(), rest)
     }
 }
