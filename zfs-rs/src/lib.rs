@@ -45,7 +45,7 @@ use crate::zap::{
     zap_hash, zap_hash_idx, zap_leaf_hash_numentries, ZapBlock, ZapLeafPhys, ZapResult, ZapStr,
     ZapString,
 };
-use crate::zpl::{DirEntry, DirEntryType, SAAttr, SAAttrPhys};
+use crate::zpl::{DirEntry, DirEntryType, SAAttr, SAAttrPhys, SABuf, SAValue};
 
 #[derive(Debug)]
 pub struct Disk {
@@ -89,6 +89,18 @@ pub struct ZfsError {
 impl From<IoError> for ZfsError {
     fn from(e: IoError) -> Self {
         ZfsErrorKind::from(e).into()
+    }
+}
+
+impl Into<IoError> for ZfsError {
+    fn into(self) -> IoError {
+        use ZfsErrorKind::*;
+        let kind = match self.source {
+            Checksum | Parse(_) | UnsupportedFeature | Invalid => IoErrorKind::InvalidData,
+            NotFound => IoErrorKind::NotFound,
+            Io(ref e) => e.kind(),
+        };
+        IoError::new(kind, self)
     }
 }
 
@@ -220,11 +232,6 @@ pub trait SPA {
                                 if ptrdata.checksum == cksum.clone().into() {
                                     Ok(())
                                 } else {
-                                    //println!("FML");
-                                    //println!("{:?}", ptr);
-                                    //println!("Invalid {:?}", Checksum::from(cksum.clone()));
-                                    //println!("  Valid {:?}", (ptrdata.checksum));
-                                    //Ok(())
                                     Err(ZfsErrorKind::Checksum)
                                 }
                             }
@@ -630,7 +637,7 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsObjectSet<'drive, Z> {
     }
     pub fn as_zpl(self) -> Option<ZfsZPLObjectSet<'drive, Z>> {
         if self.os.os_type == dmu::OsType::ZFS {
-            Some(ZfsZPLObjectSet { os: self })
+            Some(ZfsZPLObjectSet::new(self))
         } else {
             None
         }
@@ -762,9 +769,19 @@ impl<'drive, 'mos, Z: DMU + DSL + ZPL + SPA> ZfsDslDataset<'drive, 'mos, Z> {
 #[derive(Debug)]
 pub struct ZfsZPLObjectSet<'drive, Z: DMU + DSL + ZPL> {
     os: ZfsObjectSet<'drive, Z>,
+    registry: Option<Result<ZfsSARegistry<'drive, Z>, ZfsError>>, // this is a stupid way to do this
 }
 
 impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
+    pub fn new(os: ZfsObjectSet<'drive, Z>) -> Self {
+        let mut fs = ZfsZPLObjectSet {
+            os: os,
+            registry: None,
+        };
+        let registry = ZfsSARegistry::new(&fs);
+        fs.registry = Some(registry);
+        fs
+    }
     pub fn get_root<'fs>(&'fs self) -> Result<ZfsZPLDir<'drive, 'fs, Z>, ZfsError> {
         let master_node = self.os.get_dnode(1)?;
         let root_obj_num = match self
@@ -797,6 +814,94 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
     }
     pub fn as_os(&self) -> &ZfsObjectSet<'drive, Z> {
         &self.os
+    }
+}
+
+impl<'drive, Z: DMU + DSL + ZPL + ZAP> ZfsZPLObjectSet<'drive, Z> {
+    pub fn get_registry(&self) -> Option<&ZfsSARegistry<'drive, Z>> {
+        self.registry.as_ref().map(|r| r.as_ref().ok()).flatten() // this is cursed
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsSARegistry<'drive, Z: DMU + DSL + ZPL> {
+    drive: &'drive ZfsDrive<Z>,
+    registry: DNodePhys,
+    layout: DNodePhys,
+}
+
+impl<'drive, Z: DMU + DSL + ZPL + ZAP> ZfsSARegistry<'drive, Z> {
+    pub fn new(fs: &ZfsZPLObjectSet<'drive, Z>) -> Result<Self, ZfsError> {
+        let drive = fs.as_os().drive;
+        let master_node = fs.as_os().get_dnode(1)?;
+        let zap_index = match drive.inner.lookup_zap(
+            &master_node,
+            &ZapString::from_byte_slice(b"SA_ATTRS").unwrap(),
+        )? {
+            Some(ZapResult::U64(r)) if r.len() == 1 => Ok(r[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+        let zap_index = fs.as_os().get_dnode(zap_index)?;
+        let registry_id = match drive.inner.lookup_zap(
+            &zap_index,
+            &ZapString::from_byte_slice(b"REGISTRY").unwrap(),
+        )? {
+            Some(ZapResult::U64(r)) if r.len() == 1 => Ok(r[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+
+        let layout_id = match drive
+            .inner
+            .lookup_zap(&zap_index, &ZapString::from_byte_slice(b"LAYOUTS").unwrap())?
+        {
+            Some(ZapResult::U64(r)) if r.len() == 1 => Ok(r[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+
+        let layout = fs.as_os().get_dnode(layout_id)?;
+        let registry = fs.as_os().get_dnode(registry_id)?;
+        Ok(Self {
+            drive,
+            registry,
+            layout,
+        })
+    }
+    pub fn lookup_layout(&self, layout_id: u16) -> Result<Vec<SAAttr>, ZfsError> {
+        let layout = self.lookup_raw_layout(layout_id)?;
+        layout
+            .into_iter()
+            .map(|id| {
+                self.lookup_attr(id)
+                    .and_then(|o| o.ok_or(ZfsErrorKind::NotFound.into()))
+            })
+            .collect()
+    }
+    fn lookup_raw_layout(&self, layout_id: u16) -> Result<Vec<u16>, ZfsError> {
+        match self
+            .drive
+            .inner
+            .lookup_zap(
+                &self.layout,
+                &ZapString::from_byte_slice(format!("{}", layout_id).as_bytes()).unwrap(),
+            )?
+            .ok_or(ZfsErrorKind::NotFound)?
+        {
+            ZapResult::U16(a) => Ok(a),
+            _ => Err(ZfsErrorKind::Invalid.into()),
+        }
+    }
+    fn lookup_attr(&self, attr_id: u16) -> Result<Option<SAAttr>, ZfsError> {
+        Ok(self
+            .drive
+            .inner
+            .list_zap(&self.registry)?
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                ZapResult::U64(v) if v.len() == 1 => Some((SAAttrPhys(v[0]), k)),
+                _ => None,
+            })
+            .find(|(a, _)| a.get_attr_num() == attr_id)
+            .map(|(attr, name)| SAAttr::new(name, attr)))
     }
 }
 
@@ -839,6 +944,86 @@ pub struct ZfsZPLFile<'drive, 'fs, Z: DMU + DSL + ZPL> {
 impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLFile<'drive, 'fs, Z> {
     pub fn new(fs: &'fs ZfsZPLObjectSet<'drive, Z>, file: DNodePhys) -> Self {
         Self { fs, file }
+    }
+    pub fn list_attributes(&self) -> Result<Vec<(SAAttr, SAValue)>, ZfsError> {
+        let (_input, buf) = SABuf::parse(&self.file.bonus)?;
+        let registry = self.fs.get_registry().ok_or(ZfsErrorKind::NotFound)?;
+        let layout = registry.lookup_layout(buf.layout)?;
+        buf.parse_attrs(layout)
+    }
+    pub fn reader<'file>(&'file self) -> Result<ZfsZPLFileReader<'drive, 'fs, 'file, Z>, ZfsError> {
+        ZfsZPLFileReader::new(self)
+    }
+}
+
+impl<'drive, 'fs, B: AsRef<[u8]>, Z: DMU<Block = B> + DSL + ZPL> ZfsZPLFile<'drive, 'fs, Z> {
+    pub fn read_block(&self, block_idx: u64) -> Result<B, ZfsError> {
+        self.fs
+            .as_os()
+            .drive
+            .inner
+            .read_block(&self.file, block_idx)
+    }
+}
+
+#[derive(Debug)]
+pub struct ZfsZPLFileReader<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> {
+    file: &'file ZfsZPLFile<'drive, 'fs, Z>,
+    buf: Vec<u8>,
+    buf_pos: usize,
+    block_num: u64,
+    file_size: u64,
+}
+
+impl<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> ZfsZPLFileReader<'drive, 'fs, 'file, Z> {
+    pub fn new(file: &'file ZfsZPLFile<'drive, 'fs, Z>) -> Result<Self, ZfsError> {
+        let attr_name = ZapString::from_byte_slice(b"ZPL_SIZE").unwrap();
+        let file_size = match file
+            .list_attributes()?
+            .into_iter()
+            .find(|(a, _v)| &*a.name == &*attr_name)
+            .ok_or(ZfsErrorKind::NotFound)?
+            .1
+        {
+            SAValue::U64(a) if a.len() == 1 => Ok(a[0]),
+            _ => Err(ZfsErrorKind::Invalid),
+        }?;
+        Ok(Self {
+            file: file,
+            buf: Vec::with_capacity(file.file.header.datablkszsec as usize * 512),
+            buf_pos: 0,
+            block_num: 0,
+            file_size,
+        })
+    }
+}
+
+impl<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> std::io::Read
+    for ZfsZPLFileReader<'drive, 'fs, 'file, Z>
+{
+    fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
+        if self.buf_pos >= self.buf.len() {
+            if self.block_num > self.file.file.header.max_block_id {
+                return Ok(0);
+            }
+            let block = self
+                .file
+                .read_block(self.block_num)
+                .map_err(Into::<IoError>::into)?;
+            self.block_num += 1;
+            self.buf.clear();
+            self.buf_pos = 0;
+            self.buf.extend_from_slice(block.as_ref());
+            let bytes_read = self.block_num * self.file.file.header.datablkszsec as u64 * 512;
+            let last_chunk = (self.block_num - 1) * self.file.file.header.datablkszsec as u64 * 512;
+            if bytes_read > self.file_size {
+                self.buf.truncate((self.file_size - last_chunk) as usize);
+            }
+        }
+        let bytes_copied = buf.len().min(self.buf.len() - self.buf_pos);
+        buf[..bytes_copied].copy_from_slice(&self.buf[self.buf_pos..(self.buf_pos + bytes_copied)]);
+        self.buf_pos += bytes_copied;
+        Ok(bytes_copied)
     }
 }
 

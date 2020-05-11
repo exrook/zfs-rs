@@ -8,6 +8,7 @@ use nom::{number::complete as number, IResult};
 use enum_repr_derive::TryFrom;
 
 use crate::zap::ZapString;
+use crate::{ZfsError, ZfsErrorKind};
 
 /// Turns out this structure isn't used anymore since ZPL version 5
 // -_-
@@ -254,6 +255,7 @@ enum DirEntryTypeInternal {
 #[derive(Debug)]
 pub struct SAAttr {
     pub name: ZapString,
+    /// Length of 0 means this attribute is of variable size (!!!)
     pub length: u16,
     pub byteswap: SAByteswapType,
 }
@@ -285,9 +287,104 @@ impl SAAttrPhys {
 #[derive(Debug, TryFrom)]
 #[repr(u8)]
 pub enum SAByteswapType {
-    UInt64Array = 0,
-    UInt32Array = 1,
-    UInt16Array = 2,
-    UInt8Array = 3,
+    U64Array = 0,
+    U32Array = 1,
+    U16Array = 2,
+    U8Array = 3,
     ACL = 4,
+}
+
+#[derive(Debug)]
+pub enum SAValue {
+    U64(Vec<u64>),
+    U32(Vec<u32>),
+    U16(Vec<u16>),
+    U8(Vec<u8>),
+    Acl(Vec<Ace>), // TODO
+}
+
+impl SAValue {
+    pub fn parse<'a>(attr: &SAAttr, len: u16, input: &'a [u8]) -> IResult<&'a [u8], Self> {
+        use SAByteswapType::*;
+        use SAValue::*;
+        let parser = |data| match attr.byteswap {
+            U64Array => nom::combinator::map(nom::multi::many0(number::le_u64), U64)(data),
+            U32Array => nom::combinator::map(nom::multi::many0(number::le_u32), U32)(data),
+            U16Array => nom::combinator::map(nom::multi::many0(number::le_u16), U16)(data),
+            U8Array => nom::combinator::map(nom::multi::many0(number::le_u8), U8)(data),
+            ACL => nom::combinator::map(nom::multi::many0(Ace::parse), Acl)(data),
+        };
+        nom::combinator::map_parser(nom::bytes::complete::take(len), parser)(input)
+    }
+}
+
+pub const SA_MAGIC: u32 = 0x2F505A;
+
+/// SA data from a bonus or spill buffer
+#[derive(Debug)]
+pub struct SABuf {
+    //magic: u32,
+    //header_size: u8,
+    // don't really need these outside of parsing, lets try leaving them out
+    pub layout: u16,
+    pub lengths: Vec<u16>,
+    pub data: Vec<u8>,
+}
+
+impl SABuf {
+    pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
+        let (input, (_magic, size_layout)) = nom::sequence::tuple((
+            nom::combinator::verify(number::le_u32, |magic| *magic == SA_MAGIC),
+            number::le_u16,
+        ))(input)?; // read 4 + 2 bytes
+        let header_size = ((size_layout >> 10) & ((1 << 6) - 1)) * 8;
+        let layout = (size_layout) & ((1 << 10) - 1);
+        let length_size = header_size - (4 + 2); // subtract the bytes we have already read
+        let (input, lengths) = nom::combinator::map_parser(
+            nom::bytes::complete::take(length_size),
+            nom::multi::many0(number::le_u16),
+        )(input)?;
+        let (input, data) = nom::combinator::rest(input)?;
+        Ok((
+            input,
+            Self {
+                // magic,
+                // header_size,
+                layout,
+                lengths,
+                data: data.to_owned(),
+            },
+        ))
+    }
+    pub fn parse_attrs(&self, layout: Vec<SAAttr>) -> Result<Vec<(SAAttr, SAValue)>, ZfsError> {
+        let attr_count = layout.len();
+        layout
+            .into_iter()
+            .scan(0, |var_length_idx, attr| {
+                // find out all the variable lengths first
+                if attr.length == 0 {
+                    Some(
+                        self.lengths
+                            .get(*var_length_idx as usize)
+                            .ok_or(ZfsErrorKind::Invalid.into())
+                            .map(|len| (attr, *len)),
+                    )
+                } else {
+                    let len = attr.length;
+                    Some(Ok((attr, len)))
+                }
+            })
+            .try_fold(
+                (&self.data[..], Vec::with_capacity(attr_count)),
+                |(input, mut out), res| match res {
+                    Ok((attr, len)) => {
+                        let (input, val) = SAValue::parse(&attr, len, input)?;
+                        out.push((attr, val));
+                        Ok((input, out))
+                    }
+                    Err(e) => Err(e),
+                },
+            )
+            .map(|(_input, out)| out)
+    }
 }

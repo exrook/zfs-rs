@@ -1,5 +1,7 @@
 use std::env::args_os;
+use std::io::Read;
 use std::path::{Component, PathBuf};
+use zfs_rs::zap::ZapResult;
 use zfs_rs::{dsl::DirPhys, zap::ZapString};
 use zfs_rs::{Device, Disk, ZfsDirEntry, ZfsDrive, ZfsDslDir, ZfsError, ZfsErrorKind};
 
@@ -63,7 +65,7 @@ fn main() {
                 let zpl_objset = dataset.get_object_set().unwrap().as_zpl().unwrap();
                 let root_dir = zpl_objset.get_root().unwrap();
 
-                let dir = zfs_fs_path
+                let res = match zfs_fs_path
                     .components()
                     .filter_map(|c| match c {
                         Component::Normal(s) => ZapString::from_byte_slice(
@@ -71,26 +73,48 @@ fn main() {
                         ),
                         _ => None,
                     })
-                    .try_fold::<_, _, Result<_, ZfsError>>(root_dir, |dir, path| {
-                        match dir.get_child(&path)?.ok_or(ZfsErrorKind::NotFound)? {
+                    .try_fold::<_, _, Result<_, Result<_, ZfsError>>>(root_dir, |dir, path| {
+                        match dir
+                            .get_child(&path)
+                            .map_err(Err)?
+                            .ok_or(ZfsErrorKind::NotFound.into())
+                            .map_err(Err)?
+                        {
                             ZfsDirEntry::Dir(d) => Ok(d),
-                            _ => Err(ZfsErrorKind::NotFound.into()),
+                            ZfsDirEntry::File(f) => Err(Ok(f)),
+                            _ => Err(Err(ZfsErrorKind::NotFound.into())),
                         }
-                    })
-                    .unwrap();
-
-                print!("Drectory listing: (");
-                for (name, e) in dir.children().unwrap() {
-                    print!(
-                        "{:?}: {},",
-                        name,
-                        match e {
-                            ZfsDirEntry::File(_) => "file",
-                            ZfsDirEntry::Dir(_) => "dir",
-                        }
-                    )
+                    }) {
+                    Ok(d) => Ok(ZfsDirEntry::Dir(d)),
+                    Err(Ok(f)) => Ok(ZfsDirEntry::File(f)),
+                    Err(Err(e)) => Err(e),
                 }
-                println!(")");
+                .unwrap();
+
+                match res {
+                    ZfsDirEntry::Dir(dir) => {
+                        print!("Drectory listing: (");
+                        for (name, e) in dir.children().unwrap() {
+                            print!(
+                                "{:?}: {},",
+                                name,
+                                match e {
+                                    ZfsDirEntry::File(_) => "file",
+                                    ZfsDirEntry::Dir(_) => "dir",
+                                }
+                            )
+                        }
+                        println!(")");
+                    }
+                    ZfsDirEntry::File(file) => {
+                        let mut reader = file.reader().unwrap();
+                        let mut s = String::new();
+                        reader.read_to_string(&mut s).unwrap();
+                        println!("START FILE CONTENTS");
+                        println!("{}", s);
+                        println!("END FILE CONTENTS");
+                    }
+                }
             }
             None => {
                 print!("Drectory listing: (");
