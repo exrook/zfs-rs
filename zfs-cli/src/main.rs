@@ -3,13 +3,13 @@ use std::io::Read;
 use std::path::{Component, PathBuf};
 use zfs_rs::zap::ZapResult;
 use zfs_rs::{dsl::DirPhys, zap::ZapString};
-use zfs_rs::{Device, Disk, ZfsDirEntry, ZfsDrive, ZfsDslDir, ZfsError, ZfsErrorKind};
+use zfs_rs::{DefaultDrive, Device, ZfsDirEntry, ZfsDrive, ZfsDslDir, ZfsError, ZfsErrorKind};
 
 fn main() {
     let path = args_os().nth(1).expect("First argument is required");
     let zfs_dataset_path = PathBuf::from(args_os().nth(2).unwrap_or("/".into()));
     let zfs_fs_path = args_os().nth(3).map(PathBuf::from);
-    let disk = Disk::new(path).expect("Unable to open disk");
+    let disk = DefaultDrive::new(path).expect("Unable to open disk");
     let label = disk.get_label(0).unwrap().unwrap();
     let mut uber = label.uberblocks;
     uber.sort_unstable_by_key(|u| u.txg);

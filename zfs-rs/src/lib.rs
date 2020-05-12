@@ -48,11 +48,11 @@ use crate::zap::{
 use crate::zpl::{DirEntry, DirEntryType, SAAttr, SAAttrPhys, SABuf, SAValue};
 
 #[derive(Debug)]
-pub struct Disk {
+pub struct DefaultDrive {
     file: File,
 }
 
-impl Disk {
+impl DefaultDrive {
     pub fn new<P: AsRef<Path>>(path: P) -> IoResult<Self> {
         let f = File::open(path)?;
         Ok(Self { file: f })
@@ -71,12 +71,18 @@ pub trait RawDevice {
     fn read_raw(&self, addr: u64, size: u64) -> IoResult<Self::Block>;
 }
 
-impl RawDevice for Disk {
+impl RawDevice for DefaultDrive {
     type Block = Vec<u8>;
     fn read_raw(&self, addr: u64, size: u64) -> IoResult<Self::Block> {
         self.read(addr, size)
     }
 }
+
+impl DefaultSPA for DefaultDrive {}
+impl DefaultDMU for DefaultDrive {}
+impl DefaultZAP for DefaultDrive {}
+impl DefaultDSL for DefaultDrive {}
+impl DefaultZPL for DefaultDrive {}
 
 #[derive(Debug, Error)]
 #[error("{source}, {backtrace}")]
@@ -302,9 +308,12 @@ pub trait SPA {
     fn read(&self, addr: DVA, psize: u32) -> Result<RawOrNah<Self::Block>, ZfsError>;
 }
 
+/// Marker trait that we want the default SPA implementation
+pub trait DefaultSPA {}
+
 impl<T, B: AsRef<[u8]>> SPA for T
 where
-    T: Device<Block = B>,
+    T: Device<Block = B> + DefaultSPA,
 {
     type Block = B;
     fn read(&self, addr: DVA, psize: u32) -> Result<RawOrNah<Self::Block>, ZfsError> {
@@ -338,9 +347,12 @@ const fn get_level_index(id: u64, level: u8, level_shift: u8) -> u64 {
     (id >> (level as u64 * level_shift as u64)) % (1 << (level_shift as u64))
 }
 
+/// Marker trait that we want the default DMU implementation
+pub trait DefaultDMU {}
+
 impl<T, B: AsRef<[u8]>> DMU for T
 where
-    T: SPA<Block = B>,
+    T: SPA<Block = B> + DefaultDMU,
 {
     type Block = RawOrNah<B>;
     fn get_objset(&self, ptr: &BlockPtr) -> Result<ObjsetPhys, ZfsError> {
@@ -368,9 +380,12 @@ pub trait ZAP {
     fn list_zap(&self, zap_dnode: &DNodePhys) -> Result<Vec<(ZapString, ZapResult)>, ZfsError>;
 }
 
+/// Marker trait that we want the default ZAP implementation
+pub trait DefaultZAP {}
+
 impl<T, B: AsRef<[u8]>> ZAP for T
 where
-    T: DMU<Block = B>,
+    T: DMU<Block = B> + DefaultZAP,
 {
     fn lookup_zap(
         &self,
@@ -467,9 +482,12 @@ pub trait DSL {
     fn get_dataset(&self, objset: &ObjsetPhys, ds_id: u64) -> Result<DatasetPhys, ZfsError>;
 }
 
+/// Marker trait that we want the default DSL implementation
+pub trait DefaultDSL {}
+
 impl<B, T> DSL for T
 where
-    T: DMU<Block = B> + ZAP,
+    T: DMU<Block = B> + ZAP + DefaultDSL,
     B: AsRef<[u8]>,
 {
     fn get_dir(&self, objset: &ObjsetPhys, dir_id: u64) -> Result<DirPhys, ZfsError> {
@@ -494,9 +512,12 @@ pub trait ZPL {
     ) -> Result<Vec<SAAttr>, ZfsError>;
 }
 
+/// Marker trait that we want the default ZPL implementation
+pub trait DefaultZPL {}
+
 impl<T, B: AsRef<[u8]>> ZPL for T
 where
-    T: ZAP + DMU<Block = B>,
+    T: ZAP + DMU<Block = B> + DefaultZPL,
 {
     fn lookup_dir_entry(
         &self,
@@ -577,12 +598,12 @@ where
 }
 
 #[derive(Debug)]
-pub struct ZfsDrive<Z: DMU + DSL + ZPL> {
+pub struct ZfsDrive<Z> {
     inner: Z,
     label: Label,
 }
 
-impl<Z: DMU + DSL + ZPL> ZfsDrive<Z> {
+impl<Z> ZfsDrive<Z> {
     pub fn new_with_label(inner: Z, label: Label) -> Self {
         Self { inner, label }
     }
@@ -591,7 +612,7 @@ impl<Z: DMU + DSL + ZPL> ZfsDrive<Z> {
     }
 }
 
-impl<Z: DMU + DSL + ZPL + SPA> ZfsDrive<Z> {
+impl<Z: DMU + SPA> ZfsDrive<Z> {
     pub fn get_most_recent_mos<'a>(&'a self) -> Result<ZfsMetaObjectSet<'a, Z>, ZfsError> {
         let mut ubers = self.label.uberblocks.clone();
         ubers.sort_unstable_by_key(|u| u.txg);
@@ -619,12 +640,12 @@ impl<Z: DMU + DSL + ZPL + Device> ZfsDrive<Z> {
 }
 
 #[derive(Debug)]
-pub struct ZfsObjectSet<'drive, Z: DMU + DSL + ZPL> {
+pub struct ZfsObjectSet<'drive, Z> {
     drive: &'drive ZfsDrive<Z>,
     pub os: ObjsetPhys,
 }
 
-impl<'drive, Z: DMU + DSL + ZPL> ZfsObjectSet<'drive, Z> {
+impl<'drive, Z: DMU> ZfsObjectSet<'drive, Z> {
     pub fn new(drive: &'drive ZfsDrive<Z>, os: ObjsetPhys) -> Self {
         Self { drive, os }
     }
@@ -635,6 +656,8 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsObjectSet<'drive, Z> {
             None
         }
     }
+}
+impl<'drive, Z: DMU + ZAP> ZfsObjectSet<'drive, Z> {
     pub fn as_zpl(self) -> Option<ZfsZPLObjectSet<'drive, Z>> {
         if self.os.os_type == dmu::OsType::ZFS {
             Some(ZfsZPLObjectSet::new(self))
@@ -642,6 +665,8 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsObjectSet<'drive, Z> {
             None
         }
     }
+}
+impl<'drive, Z: DMU> ZfsObjectSet<'drive, Z> {
     pub fn as_zvol(self) -> Option<ZfsZVolObjectSet<'drive, Z>> {
         if self.os.os_type == dmu::OsType::ZFS {
             Some(ZfsZVolObjectSet { os: self })
@@ -655,11 +680,11 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsObjectSet<'drive, Z> {
 }
 
 #[derive(Debug)]
-pub struct ZfsMetaObjectSet<'drive, Z: DMU + DSL + ZPL> {
+pub struct ZfsMetaObjectSet<'drive, Z> {
     os: ZfsObjectSet<'drive, Z>,
 }
 
-impl<'drive, Z: DMU + DSL + ZPL> ZfsMetaObjectSet<'drive, Z> {
+impl<'drive, Z: DSL + DMU + ZAP> ZfsMetaObjectSet<'drive, Z> {
     pub fn get_root_dir<'mos>(&'mos self) -> Result<ZfsDslDir<'drive, 'mos, Z>, ZfsError> {
         let mos_config = self.os.get_dnode(1)?;
         let root_obj_num = match self
@@ -699,12 +724,12 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsMetaObjectSet<'drive, Z> {
 }
 
 #[derive(Debug)]
-pub struct ZfsDslDir<'drive, 'mos, Z: DMU + DSL + ZPL> {
+pub struct ZfsDslDir<'drive, 'mos, Z> {
     mos: &'mos ZfsMetaObjectSet<'drive, Z>,
     dsl_dir: DirPhys,
 }
 
-impl<'drive, 'mos, Z: DMU + DSL + ZPL> ZfsDslDir<'drive, 'mos, Z> {
+impl<'drive, 'mos, Z: DSL + DMU + ZAP> ZfsDslDir<'drive, 'mos, Z> {
     pub fn new(
         mos: &'mos ZfsMetaObjectSet<'drive, Z>,
         dsl_dir: DirPhys,
@@ -716,7 +741,7 @@ impl<'drive, 'mos, Z: DMU + DSL + ZPL> ZfsDslDir<'drive, 'mos, Z> {
     }
 }
 
-impl<'drive, 'mos, Z: DMU + DSL + ZPL + ZAP> ZfsDslDir<'drive, 'mos, Z> {
+impl<'drive, 'mos, Z: DMU + ZAP + DSL> ZfsDslDir<'drive, 'mos, Z> {
     pub fn children(&self) -> Result<Vec<(ZapString, ZfsDslDir<'drive, 'mos, Z>)>, ZfsError> {
         let child_zap = self.mos.os.get_dnode(self.dsl_dir.child_dir_zapobj)?;
         let children = self.mos.os.drive.inner.list_zap(&child_zap)?;
@@ -746,12 +771,12 @@ impl<'drive, 'mos, Z: DMU + DSL + ZPL + ZAP> ZfsDslDir<'drive, 'mos, Z> {
 }
 
 #[derive(Debug)]
-pub struct ZfsDslDataset<'drive, 'mos, Z: DMU + DSL + ZPL> {
+pub struct ZfsDslDataset<'drive, 'mos, Z> {
     mos: &'mos ZfsMetaObjectSet<'drive, Z>,
     dsl_ds: DatasetPhys,
 }
 
-impl<'drive, 'mos, Z: DMU + DSL + ZPL> ZfsDslDataset<'drive, 'mos, Z> {
+impl<'drive, 'mos, Z> ZfsDslDataset<'drive, 'mos, Z> {
     pub fn new(
         mos: &'mos ZfsMetaObjectSet<'drive, Z>,
         dsl_ds: DatasetPhys,
@@ -760,19 +785,19 @@ impl<'drive, 'mos, Z: DMU + DSL + ZPL> ZfsDslDataset<'drive, 'mos, Z> {
     }
 }
 
-impl<'drive, 'mos, Z: DMU + DSL + ZPL + SPA> ZfsDslDataset<'drive, 'mos, Z> {
+impl<'drive, 'mos, Z: SPA + DMU> ZfsDslDataset<'drive, 'mos, Z> {
     pub fn get_object_set(&self) -> Result<ZfsObjectSet<'drive, Z>, ZfsError> {
         self.mos.os.drive.get_object_set(&self.dsl_ds.bp)
     }
 }
 
 #[derive(Debug)]
-pub struct ZfsZPLObjectSet<'drive, Z: DMU + DSL + ZPL> {
+pub struct ZfsZPLObjectSet<'drive, Z> {
     os: ZfsObjectSet<'drive, Z>,
     registry: Option<Result<ZfsSARegistry<'drive, Z>, ZfsError>>, // this is a stupid way to do this
 }
 
-impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
+impl<'drive, Z: DMU + ZAP> ZfsZPLObjectSet<'drive, Z> {
     pub fn new(os: ZfsObjectSet<'drive, Z>) -> Self {
         let mut fs = ZfsZPLObjectSet {
             os: os,
@@ -782,6 +807,8 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
         fs.registry = Some(registry);
         fs
     }
+}
+impl<'drive, Z: DMU + ZAP + ZPL> ZfsZPLObjectSet<'drive, Z> {
     pub fn get_root<'fs>(&'fs self) -> Result<ZfsZPLDir<'drive, 'fs, Z>, ZfsError> {
         let master_node = self.os.get_dnode(1)?;
         let root_obj_num = match self
@@ -796,10 +823,14 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
         }?;
         self.get_dir(root_obj_num)
     }
+}
+impl<'drive, Z: DMU + ZPL> ZfsZPLObjectSet<'drive, Z> {
     pub fn get_dir<'fs>(&'fs self, obj_num: u64) -> Result<ZfsZPLDir<'drive, 'fs, Z>, ZfsError> {
         let dir_obj = self.os.get_dnode(obj_num)?;
         Ok(ZfsZPLDir::new(self, dir_obj))
     }
+}
+impl<'drive, Z: DMU + ZPL> ZfsZPLObjectSet<'drive, Z> {
     // TODO: remove option after implementing other object types
     pub fn get_dir_entry<'fs>(
         &'fs self,
@@ -812,25 +843,27 @@ impl<'drive, Z: DMU + DSL + ZPL> ZfsZPLObjectSet<'drive, Z> {
             _ => Ok(None), // TODO: implement other types
         }
     }
+}
+impl<'drive, Z> ZfsZPLObjectSet<'drive, Z> {
     pub fn as_os(&self) -> &ZfsObjectSet<'drive, Z> {
         &self.os
     }
 }
 
-impl<'drive, Z: DMU + DSL + ZPL + ZAP> ZfsZPLObjectSet<'drive, Z> {
+impl<'drive, Z> ZfsZPLObjectSet<'drive, Z> {
     pub fn get_registry(&self) -> Option<&ZfsSARegistry<'drive, Z>> {
         self.registry.as_ref().map(|r| r.as_ref().ok()).flatten() // this is cursed
     }
 }
 
 #[derive(Debug)]
-pub struct ZfsSARegistry<'drive, Z: DMU + DSL + ZPL> {
+pub struct ZfsSARegistry<'drive, Z> {
     drive: &'drive ZfsDrive<Z>,
     registry: DNodePhys,
     layout: DNodePhys,
 }
 
-impl<'drive, Z: DMU + DSL + ZPL + ZAP> ZfsSARegistry<'drive, Z> {
+impl<'drive, Z: DMU + ZAP> ZfsSARegistry<'drive, Z> {
     pub fn new(fs: &ZfsZPLObjectSet<'drive, Z>) -> Result<Self, ZfsError> {
         let drive = fs.as_os().drive;
         let master_node = fs.as_os().get_dnode(1)?;
@@ -866,6 +899,8 @@ impl<'drive, Z: DMU + DSL + ZPL + ZAP> ZfsSARegistry<'drive, Z> {
             layout,
         })
     }
+}
+impl<'drive, Z: ZAP> ZfsSARegistry<'drive, Z> {
     pub fn lookup_layout(&self, layout_id: u16) -> Result<Vec<SAAttr>, ZfsError> {
         let layout = self.lookup_raw_layout(layout_id)?;
         layout
@@ -906,12 +941,12 @@ impl<'drive, Z: DMU + DSL + ZPL + ZAP> ZfsSARegistry<'drive, Z> {
 }
 
 #[derive(Debug)]
-pub struct ZfsZPLDir<'drive, 'fs, Z: DMU + DSL + ZPL> {
+pub struct ZfsZPLDir<'drive, 'fs, Z> {
     fs: &'fs ZfsZPLObjectSet<'drive, Z>,
     dir: DNodePhys,
 }
 
-impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLDir<'drive, 'fs, Z> {
+impl<'drive, 'fs, Z: ZPL + DMU> ZfsZPLDir<'drive, 'fs, Z> {
     pub fn new(fs: &'fs ZfsZPLObjectSet<'drive, Z>, dir: DNodePhys) -> Self {
         Self { fs, dir }
     }
@@ -936,15 +971,17 @@ impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLDir<'drive, 'fs, Z> {
 }
 
 #[derive(Debug)]
-pub struct ZfsZPLFile<'drive, 'fs, Z: DMU + DSL + ZPL> {
+pub struct ZfsZPLFile<'drive, 'fs, Z> {
     fs: &'fs ZfsZPLObjectSet<'drive, Z>,
     file: DNodePhys,
 }
 
-impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLFile<'drive, 'fs, Z> {
+impl<'drive, 'fs, Z> ZfsZPLFile<'drive, 'fs, Z> {
     pub fn new(fs: &'fs ZfsZPLObjectSet<'drive, Z>, file: DNodePhys) -> Self {
         Self { fs, file }
     }
+}
+impl<'drive, 'fs, Z: ZAP> ZfsZPLFile<'drive, 'fs, Z> {
     pub fn list_attributes(&self) -> Result<Vec<(SAAttr, SAValue)>, ZfsError> {
         let (_input, buf) = SABuf::parse(&self.file.bonus)?;
         let registry = self.fs.get_registry().ok_or(ZfsErrorKind::NotFound)?;
@@ -956,7 +993,7 @@ impl<'drive, 'fs, Z: DMU + DSL + ZPL> ZfsZPLFile<'drive, 'fs, Z> {
     }
 }
 
-impl<'drive, 'fs, B: AsRef<[u8]>, Z: DMU<Block = B> + DSL + ZPL> ZfsZPLFile<'drive, 'fs, Z> {
+impl<'drive, 'fs, B: AsRef<[u8]>, Z: DMU<Block = B>> ZfsZPLFile<'drive, 'fs, Z> {
     pub fn read_block(&self, block_idx: u64) -> Result<B, ZfsError> {
         self.fs
             .as_os()
@@ -967,7 +1004,7 @@ impl<'drive, 'fs, B: AsRef<[u8]>, Z: DMU<Block = B> + DSL + ZPL> ZfsZPLFile<'dri
 }
 
 #[derive(Debug)]
-pub struct ZfsZPLFileReader<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> {
+pub struct ZfsZPLFileReader<'drive, 'fs, 'file, Z> {
     file: &'file ZfsZPLFile<'drive, 'fs, Z>,
     buf: Vec<u8>,
     buf_pos: usize,
@@ -975,7 +1012,7 @@ pub struct ZfsZPLFileReader<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> {
     file_size: u64,
 }
 
-impl<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> ZfsZPLFileReader<'drive, 'fs, 'file, Z> {
+impl<'drive, 'fs, 'file, Z: ZAP> ZfsZPLFileReader<'drive, 'fs, 'file, Z> {
     pub fn new(file: &'file ZfsZPLFile<'drive, 'fs, Z>) -> Result<Self, ZfsError> {
         let attr_name = ZapString::from_byte_slice(b"ZPL_SIZE").unwrap();
         let file_size = match file
@@ -998,9 +1035,7 @@ impl<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> ZfsZPLFileReader<'drive, 'fs, 'file
     }
 }
 
-impl<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> std::io::Read
-    for ZfsZPLFileReader<'drive, 'fs, 'file, Z>
-{
+impl<'drive, 'fs, 'file, Z: DMU> std::io::Read for ZfsZPLFileReader<'drive, 'fs, 'file, Z> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         if self.buf_pos >= self.buf.len() {
             if self.block_num > self.file.file.header.max_block_id {
@@ -1028,12 +1063,12 @@ impl<'drive, 'fs, 'file, Z: DMU + DSL + ZPL> std::io::Read
 }
 
 #[derive(Debug)]
-pub enum ZfsDirEntry<'drive, 'fs, Z: DMU + DSL + ZPL> {
+pub enum ZfsDirEntry<'drive, 'fs, Z> {
     Dir(ZfsZPLDir<'drive, 'fs, Z>),
     File(ZfsZPLFile<'drive, 'fs, Z>),
 }
 
 #[derive(Debug)]
-pub struct ZfsZVolObjectSet<'drive, Z: DMU + DSL + ZPL> {
+pub struct ZfsZVolObjectSet<'drive, Z> {
     os: ZfsObjectSet<'drive, Z>,
 }

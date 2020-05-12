@@ -720,7 +720,6 @@ dependencies = [
  "enum-repr-derive",
  "lz4-compression",
  "nom",
- "rocket",
  "thiserror",
 ]
 
