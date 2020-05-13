@@ -10,6 +10,16 @@ use enum_repr_derive::TryFrom;
 
 use crate::fletcher::{Fletcher2, Fletcher4};
 
+/// The disk label contains the top level metadata for the filesystem
+///
+/// There are four copies of the disk label stored per disk, two at the start and two at the
+/// end of the disk.
+///
+/// The `nv_pairs` contains metadata about the disk including options used when creating the
+/// filesystem. Parsing this datastructure is not currently implemented
+///
+/// The `uberblocks` array contains the most recent uberblocks written, each of which includes a
+/// `BlockPtr` referencing the top level meta object set
 // TODO: implement boot_header and nv_pairs parsing
 #[derive(Debug, Clone)]
 pub struct Label {
@@ -44,13 +54,20 @@ impl Label {
     }
 }
 
+/// The uberblock points to the meta object set for the current transaction group
 #[derive(Debug, Clone)]
 pub struct Uberblock {
+    /// Always 0x00BAB10C (oo-ba-block)
     pub magic: u64,
+    /// Version of the on disk format
     pub version: u64,
+    /// The transaction group this uberblock is for
     pub txg: u64,
+    /// Sum of the GUIDs for all vdevs in this pool
     pub guid_sum: u64,
+    /// number of seconds since 1970 when this uberblock was written
     pub timestamp: u64,
+    /// BlockPtr pointing to the meta object set
     pub rootbp: BlockPtr,
     pub software_version: u64,
     pub mmp_magic: u64,
@@ -109,12 +126,19 @@ impl Uberblock {
     }
 }
 
+/// Data Virtual Address, a raw pointer of sorts to a location on disk
 #[derive(Copy, Clone)]
 pub struct DVA {
+    /// The id of the vdev the pointed at blocks reside on
     pub vdev: u32,
+    /// Something to do with raidz
     pub grid: u8,
+    /// Allocated size (of what, I'm not certain)
     pub asize: u32,
+    /// Offset into the vdev the blocks reside at
     pub offset: u64,
+    /// Whether or not this is a gang pointer, used to fragment a block when a large enough
+    /// chunk of contiguous free space can't be found
     pub gang: bool,
 }
 
@@ -131,10 +155,6 @@ impl fmt::Debug for DVA {
 }
 
 impl DVA {
-    pub fn from_raw(bytes: &[u8]) -> Self {
-        assert!(bytes.len() == 16);
-        Self::parse(bytes).unwrap().1
-    }
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, (asize, grid, vdev)) =
             nom::sequence::tuple((number::le_u24, number::le_u8, number::le_u32))(input)?;
@@ -157,6 +177,7 @@ impl DVA {
     }
 }
 
+/// A checksum of bytes pointed to by a blockptr
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub struct Checksum {
     pub checksum: [u64; 4],
@@ -195,6 +216,7 @@ impl Checksum {
     }
 }
 
+/// Compression algorithm to use
 #[repr(u8)]
 #[derive(Debug, Clone, TryFrom, Eq, PartialEq)]
 pub enum CompressionType {
@@ -222,6 +244,7 @@ impl CompressionType {
     }
 }
 
+/// Checksum algorithm to use
 #[repr(u8)]
 #[derive(Debug, Clone, TryFrom, Eq, PartialEq)]
 pub enum ChecksumType {
@@ -246,30 +269,58 @@ impl ChecksumType {
     }
 }
 
+/// A pointer to other blocks on disk
+///
+/// The integrity of the data pointed at can be verified using the checksum stored in the
+/// `BlockPtr`
+///
+/// The data may be compressed using the algorithm specified in `compression_type`
+///
+/// The data may also be stored inline in the block pointer itself
 #[derive(Debug, Clone)]
 pub struct BlockPtr {
+    /// Either the inline data or the pointer data
     pub embedded: BlockPtrKind,
+    /// The endianness of the data pointed at
     pub byteorder: bool,
     pub dedup: bool,
+    /// Whether the data is encrypted or not (the block pointer layout is different in this case
+    /// but encyrption is not currently supported)
     pub encryption: bool,
+    /// What type of data is pointed at
     pub kind: u8,
+    /// What compression algorithm is used to decompress the datga
     pub compression_type: CompressionType,
+    /// Whether data is stored inline in the `BlockPtr` or not
     pub embedded_data: bool,
+    /// How many layers of indirect blocks before we reach data blocks
     pub indirection_level: u8,
+    /// The size on disk of the data pointed at. Stored as number of 512 byte sectors, **minus 1**, so
+    /// a `physical_size` of 0 = 512 bytes
     pub physical_size: u16,
+    /// The size of the data pointed at, after decompression/decryption. Stored as number of 512
+    /// byte sectors, **minus 1**, so a `logical_size` of 0 = 512 bytes
     pub logical_size: u16,
+    /// The transcation group this block was created in
     pub logical_transaction: u64,
 }
 
+/// Fields of the block pointer present when data is not stored inline
 #[derive(Debug, Clone)]
 pub struct BlockPtrPtr {
+    /// Pointers to the data on disk. Each `DVA` points to the same data, stored in a different
+    /// location, for redundancy. If only one or two `DVA`s are used the others will be zeroed
     pub addresses: [DVA; 3],
+    /// The transcation group the space for this block was allocated in
     pub physical_transaction: u64,
+    /// What checksum type was used
     pub checksum_type: ChecksumType,
     pub fill_count: u64,
+    /// The checksum itself
     pub checksum: Checksum,
 }
 
+/// Whether this `BlockPtr` has data stored inline or not
 #[derive(Debug, Clone)]
 pub enum BlockPtrKind {
     Ptr(BlockPtrPtr),
@@ -277,10 +328,6 @@ pub enum BlockPtrKind {
 }
 
 impl BlockPtr {
-    pub fn from_raw(bytes: &[u8]) -> Self {
-        assert!(bytes.len() == 128);
-        Self::parse(bytes).unwrap().1
-    }
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         let (input, (_pad, flags)) = nom::combinator::peek(nom::sequence::tuple((
             nom::bytes::complete::take(6 * 8usize),
@@ -413,6 +460,7 @@ impl BlockPtr {
     }
 }
 
+/// Gang block header
 #[derive(Debug, Clone)]
 pub struct ZioGbh {
     pub blkptr: [BlockPtr; 3],
@@ -438,6 +486,7 @@ impl ZioGbh {
     }
 }
 
+/// Gang block tail containing checksum of the gang block
 #[derive(Debug, Clone)]
 pub struct ZioBlockTail {
     pub magic: u64,

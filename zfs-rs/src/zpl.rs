@@ -100,6 +100,7 @@ impl ZNodePhys {
 
 pub const ACE_SLOT_CNT: usize = 6;
 
+/// Access control list in the old format
 #[derive(Debug, Clone)]
 pub struct ZNodeAcl {
     pub extern_obj: u64,
@@ -130,6 +131,7 @@ impl ZNodeAcl {
     }
 }
 
+/// Acess control list entry
 #[derive(Debug, Clone)]
 pub struct Ace {
     pub who: u64,
@@ -158,6 +160,8 @@ impl Ace {
     }
 }
 
+/// A directory entry containing an object id pointing to the child object, and the type of the
+/// object
 #[derive(Debug)]
 pub struct DirEntry(pub u64);
 
@@ -177,6 +181,7 @@ impl DirEntry {
     }
 }
 
+/// The types of directory entries
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum DirEntryType {
     NotSpecified,
@@ -252,6 +257,7 @@ enum DirEntryTypeInternal {
     // invalid
 }
 
+/// A system attribute type
 #[derive(Debug)]
 pub struct SAAttr {
     pub name: ZapString,
@@ -270,6 +276,7 @@ impl SAAttr {
     }
 }
 
+/// How system attributes are stored in the SA registry
 #[derive(Debug, Clone)]
 pub struct SAAttrPhys(pub u64);
 impl SAAttrPhys {
@@ -284,6 +291,7 @@ impl SAAttrPhys {
     }
 }
 
+/// How to byteswap the value of an attribute
 #[derive(Debug, TryFrom)]
 #[repr(u8)]
 pub enum SAByteswapType {
@@ -294,6 +302,7 @@ pub enum SAByteswapType {
     ACL = 4,
 }
 
+/// The type of the data stored in the system attribute
 #[derive(Debug)]
 pub enum SAValue {
     U64(Vec<u64>),

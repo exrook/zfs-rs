@@ -649,9 +649,19 @@ impl<'drive, Z: DMU> ZfsObjectSet<'drive, Z> {
     pub fn new(drive: &'drive ZfsDrive<Z>, os: ObjsetPhys) -> Self {
         Self { drive, os }
     }
+    pub fn get_dnode(&self, obj_num: u64) -> Result<DNodePhys, ZfsError> {
+        self.drive.inner.get_dnode(&self.os, obj_num)
+    }
     pub fn as_mos(self) -> Option<ZfsMetaObjectSet<'drive, Z>> {
         if self.os.os_type == dmu::OsType::META {
             Some(ZfsMetaObjectSet { os: self })
+        } else {
+            None
+        }
+    }
+    pub fn as_zvol(self) -> Option<ZfsZVolObjectSet<'drive, Z>> {
+        if self.os.os_type == dmu::OsType::ZFS {
+            Some(ZfsZVolObjectSet { os: self })
         } else {
             None
         }
@@ -664,18 +674,6 @@ impl<'drive, Z: DMU + ZAP> ZfsObjectSet<'drive, Z> {
         } else {
             None
         }
-    }
-}
-impl<'drive, Z: DMU> ZfsObjectSet<'drive, Z> {
-    pub fn as_zvol(self) -> Option<ZfsZVolObjectSet<'drive, Z>> {
-        if self.os.os_type == dmu::OsType::ZFS {
-            Some(ZfsZVolObjectSet { os: self })
-        } else {
-            None
-        }
-    }
-    pub fn get_dnode(&self, obj_num: u64) -> Result<DNodePhys, ZfsError> {
-        self.drive.inner.get_dnode(&self.os, obj_num)
     }
 }
 
@@ -718,6 +716,8 @@ impl<'drive, Z: DSL + DMU + ZAP> ZfsMetaObjectSet<'drive, Z> {
         let ds_obj = self.os.drive.inner.get_dataset(&self.os.os, obj_num)?;
         Ok(ZfsDslDataset::new(self, ds_obj))
     }
+}
+impl<'drive, Z> ZfsMetaObjectSet<'drive, Z> {
     pub fn as_os(&self) -> &ZfsObjectSet<'drive, Z> {
         &self.os
     }
@@ -829,8 +829,7 @@ impl<'drive, Z: DMU + ZPL> ZfsZPLObjectSet<'drive, Z> {
         let dir_obj = self.os.get_dnode(obj_num)?;
         Ok(ZfsZPLDir::new(self, dir_obj))
     }
-}
-impl<'drive, Z: DMU + ZPL> ZfsZPLObjectSet<'drive, Z> {
+
     // TODO: remove option after implementing other object types
     pub fn get_dir_entry<'fs>(
         &'fs self,
@@ -848,9 +847,6 @@ impl<'drive, Z> ZfsZPLObjectSet<'drive, Z> {
     pub fn as_os(&self) -> &ZfsObjectSet<'drive, Z> {
         &self.os
     }
-}
-
-impl<'drive, Z> ZfsZPLObjectSet<'drive, Z> {
     pub fn get_registry(&self) -> Option<&ZfsSARegistry<'drive, Z>> {
         self.registry.as_ref().map(|r| r.as_ref().ok()).flatten() // this is cursed
     }

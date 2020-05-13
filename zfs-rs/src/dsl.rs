@@ -5,6 +5,7 @@ use nom::{number::complete as number, IResult};
 
 use crate::spa::BlockPtr;
 
+/// A DSL dataset contains a `BlockPtr` referencing an Object Set
 #[derive(Debug, Clone)]
 pub struct DatasetPhys {
     pub dir_obj: u64,
@@ -23,8 +24,10 @@ pub struct DatasetPhys {
     pub fsid_guid: u64,
     pub guid: u64,
     pub flags: u64,
+    /// `BlockPtr` to the object set
     pub bp: BlockPtr,
     pub next_clones_obj: u64,
+    /// ZAP object containing properties
     pub props_obj: u64,
     pub userrefs_obj: u64,
 }
@@ -108,18 +111,22 @@ impl DatasetPhys {
     }
 }
 
+/// A DSL Dir points to a dataset and child DSL Dirs
 #[derive(Debug, Clone)]
 pub struct DirPhys {
     pub creation_time: u64,
+    /// The dataset for this directory
     pub head_dataset_obj: u64,
     pub parent_obj: u64,
     pub clone_parent_obj: u64,
+    /// A ZAP object containing children of this directory
     pub child_dir_zapobj: u64,
     pub used_bytes: u64,
     pub compressed_bytes: u64,
     pub uncompressed_bytes: u64,
     pub quota: u64,
     pub reserved: u64,
+    /// ZAP object containing properties
     pub props_zapobj: u64,
     pub deleg_zapobj: u64,
     pub flags: u64,

@@ -12,6 +12,7 @@ use nom::{number::complete as number, IResult};
 use crc::crc64;
 use crc::CalcType;
 
+/// A string of non-zero bytes
 #[derive(Clone)]
 pub struct ZapString(Vec<MyNonZeroU8>);
 impl FromIterator<MyNonZeroU8> for ZapString {
@@ -75,8 +76,10 @@ impl DerefMut for ZapString {
     }
 }
 
+/// A slice of non-zero bytes
 pub type ZapStr = [MyNonZeroU8];
 
+/// Wrapper for stdlib type `NonZeroU8` allowing us to implement traits
 #[derive(Clone, Copy, Eq, PartialEq, Debug, Ord, PartialOrd)]
 #[repr(transparent)]
 pub struct MyNonZeroU8(NonZeroU8);
@@ -107,6 +110,7 @@ fn cast_nonzero_u8<'a>(input: &'a [MyNonZeroU8]) -> &'a [u8] {
     unsafe { &*(input as *const [MyNonZeroU8] as *const [u8]) }
 }
 
+/// The possible types a ZAP value can have
 #[derive(Debug, Clone)]
 pub enum ZapResult {
     U8(Vec<u8>),
@@ -139,10 +143,11 @@ impl ZapResult {
     }
 }
 
-const ZBT_MICRO: u64 = (1 << 63) + 3;
-const ZBT_HEADER: u64 = (1 << 63) + 1;
-const ZBT_LEAF: u64 = (1 << 63) + 0;
+pub const ZBT_MICRO: u64 = (1 << 63) + 3;
+pub const ZBT_HEADER: u64 = (1 << 63) + 1;
+pub const ZBT_LEAF: u64 = (1 << 63) + 0;
 
+/// One block of a ZAP object
 #[derive(Debug, Clone)]
 pub enum ZapBlock {
     MicroZap(MZapPhys),
@@ -161,10 +166,18 @@ impl ZapBlock {
     }
 }
 
+/// The micro ZAP format is used to save space in certain cases when the full "fat" ZAP format is
+/// not required
+///
+/// The micro ZAP is used when all keys are under 50 bytes long, and only a single U64 is stored
+/// for each key
 #[derive(Debug, Clone)]
 pub struct MZapPhys {
+    /// Always `ZBT_MICRO`
     pub block_type: u64,
+    /// Salt used when hashing entries
     pub salt: u64,
+    /// Normalization flags for keys
     pub normflags: u64,
     pub entries: Vec<MZapEntryPhys>,
 }
@@ -192,6 +205,7 @@ impl MZapPhys {
             },
         ))
     }
+    /// Lookup the `key` in this block
     pub fn lookup(&self, key: &ZapStr) -> Option<u64> {
         if key.len() >= 50 {
             // mzap strings are 50 bytes long max, including null terminators
@@ -221,6 +235,7 @@ impl MZapPhys {
         //    idx = (idx + 1) % self.entries.len();
         //}
     }
+    /// Get all entries
     pub fn get_entries(&self) -> Vec<(ZapString, u64)> {
         self.entries
             .iter()
@@ -230,11 +245,15 @@ impl MZapPhys {
     }
 }
 
+/// One entry in a micro ZAP block
 #[derive(Clone)]
 pub struct MZapEntryPhys {
+    /// The value
     pub value: u64,
+    /// Collision detection, not implemented
     pub cd: u32,
     //name: [u8; 50],
+    /// The name
     pub name: Vec<u8>,
 }
 
@@ -267,32 +286,24 @@ impl fmt::Debug for MZapEntryPhys {
     }
 }
 
-#[derive(Clone)]
+/// The fat ZAP header block
+///
+/// Contains the first level hash table and pointers to leaf blocks
+#[derive(Debug, Clone)]
 pub struct ZapPhys {
+    /// Always `ZBT_HEADER`
     pub block_type: u64,
     pub magic: u64,
+    /// Metadata about the first level hash table
     pub ptrtbl: ZapTablePhys,
     pub freeblk: u64,
     pub num_leafs: u64,
     pub num_entries: u64,
+    /// Salt used when hashing
     pub salt: u64,
     //leafs: [u64; 8192],
+    /// First level hash table, if stored in the header
     pub leafs: Vec<u64>,
-}
-
-impl fmt::Debug for ZapPhys {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ZapPhys")
-            .field("block_type", &self.block_type)
-            .field("magic", &self.magic)
-            .field("ptrtbl", &self.ptrtbl)
-            .field("freeblk", &self.freeblk)
-            .field("num_leafs", &self.num_leafs)
-            .field("num_entries", &self.num_entries)
-            .field("salt", &self.salt)
-            .field("leafs", &&self.leafs[..])
-            .finish()
-    }
 }
 
 impl ZapPhys {
@@ -327,9 +338,11 @@ impl ZapPhys {
     }
 }
 
+/// Metadata about the first level hash table
 #[derive(Debug, Clone)]
 pub struct ZapTablePhys {
-    pub blk: u64, // pointer to first block of pointer table, block ID pointer
+    /// Pointer to first block of hash table, block ID pointer, 0 if stored in the header
+    pub blk: u64,
     pub numblks: u64,
     pub shift: u64,
     pub nextblk: u64,
@@ -379,10 +392,12 @@ fn leaf_idx(hash: u64, entry_shift: u32, prefix_len: u16) -> u64 {
     shifted & ((1 << entry_shift) - 1) // mask the high bits we don't want
 }
 
+/// A fat ZAP leaf block, contains a second level of hash table pointing to values
 #[derive(Debug, Clone)]
 pub struct ZapLeafPhys {
     pub hdr: ZapLeafHeader,
     //hash: [u16; ZAP_LEAF_HASH_NUMENTRIES],
+    /// The second level hash table
     pub hash: Vec<u16>,
     //chunks: [ZapLeafChunk; ZAP_LEAF_NUMCHUNKS]
     pub chunks: Vec<ZapLeafChunk>,
@@ -398,6 +413,7 @@ impl ZapLeafPhys {
             nom::multi::count(ZapLeafChunk::parse, zap_leaf_numchunks(block_size))(input)?;
         Ok((input, Self { hdr, hash, chunks }))
     }
+    /// Lookup the `key` with the given `hash` in this chunk, shifting the hash by `leaf_block_shift`
     pub fn lookup(&self, key: &ZapStr, hash: u64, leaf_block_shift: u32) -> Option<ZapResult> {
         let mut leaf_idx = leaf_idx(hash, leaf_block_shift, self.hdr.prefix_len);
         loop {
@@ -465,6 +481,7 @@ impl ZapLeafPhys {
             }
         }
     }
+    /// Get a list of all entries in this chunk
     pub fn get_entries(&self) -> Vec<(ZapString, ZapResult)> {
         self.chunks
             .iter()
@@ -484,6 +501,7 @@ impl ZapLeafPhys {
     }
 }
 
+/// Metadata for a fat ZAP leaf block
 #[derive(Debug, Clone)]
 pub struct ZapLeafHeader {
     pub block_type: u64,
@@ -535,6 +553,7 @@ const ZAP_LEAF_ENTRY: u8 = 252;
 const ZAP_LEAF_ARRAY: u8 = 251;
 const ZAP_LEAF_FREE: u8 = 253;
 
+/// A chunk in a ZAP leaf block
 #[derive(Debug, Clone)]
 pub enum ZapLeafChunk {
     Entry(ZapLeafEntry),
@@ -562,6 +581,7 @@ impl ZapLeafChunk {
     }
 }
 
+/// A ZAP leaf chunk containing metadata for an entry
 #[derive(Debug, Clone)]
 pub struct ZapLeafEntry {
     pub kind: u8,
@@ -620,6 +640,7 @@ impl ZapLeafEntry {
     }
 }
 
+/// A ZAP leaf chunk containing data for an entry
 #[derive(Debug, Clone)]
 pub struct ZapLeafArray {
     pub kind: u8,
@@ -645,6 +666,7 @@ impl ZapLeafArray {
     }
 }
 
+/// An unused ZAP leaf chunk
 #[derive(Debug, Clone)]
 pub struct ZapLeafFree {
     pub kind: u8,

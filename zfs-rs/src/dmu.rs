@@ -10,26 +10,35 @@ use enum_repr_derive::TryFrom;
 use crate::spa::BlockPtr;
 use crate::zil::ZilHeader;
 
+/// Metadata stored in the DNode header
 #[derive(Debug, Clone)]
 pub struct DNodePhysHeader {
+    /// What type of DNode is this
     pub kind: u8,
+    /// How big are the indirect blocks, log base 2 (size = `2^indirect_block_shift`), in bytes
     pub indirect_block_shift: u8,
+    /// How many `BlockPtr`s do we traverse before we hit data blocks
     pub levels: u8,
+    /// How many block pointers are stored in this DNode, range from 1 to 3
     pub num_block_ptr: u8,
+    /// The type of the data stored in the bonus buffer
     pub bonus_type: u8,
+    /// The checksum algorithm used for the data pointed at by this DNode
     pub checksum: u8,
+    /// The type of compression used for the data pointed at by this DNode
     pub compress: u8,
+    /// Size of a datablock, stored as number of 512 byte sectors.
+    /// `Size in bytes = 512 * datablkszsec`
     pub datablkszsec: u16, // idk what this one is
+    /// How big the bonus buffer is
     pub bonus_len: u16,
+    /// ID of the largest data block pointed to by this DNode
     pub max_block_id: u64,
+    /// Sum of the asize values of all direct and indirect block pointers referenced by this DNode
     pub sec_phys: u64,
 }
 
 impl DNodePhysHeader {
-    pub fn from_raw(bytes: &[u8]) -> Self {
-        assert!(bytes.len() == 64);
-        Self::parse(bytes).unwrap().1
-    }
     pub fn parse(input: &[u8]) -> IResult<&[u8], Self> {
         let (
             input,
@@ -69,6 +78,9 @@ impl DNodePhysHeader {
     }
 }
 
+/// Every ZFS object on disk is represented by a DNode. The DNode can contain metadata about the
+/// object, stored in the `bonus` buffer, or block pointers to areas on disk containing the
+/// object's data, or both.
 #[derive(Debug, Clone)]
 pub struct DNodePhys {
     pub header: DNodePhysHeader,
@@ -95,10 +107,15 @@ impl DNodePhys {
     }
 }
 
+/// An object set is the foundational datastructure used in ZFS, everything other object exists
+/// as a member of an objectset, known as a DNode. DNodes may contain metadata and/or a pointer
+/// to blocks on disk containing data
 #[derive(Debug, Clone)]
 pub struct ObjsetPhys {
+    /// The metadnode's block pointers point to an array of DNodes, the members of the object set
     pub metadnode: DNodePhys,
     pub os_zil_header: ZilHeader,
+    /// What type of object set is this
     pub os_type: OsType,
 }
 
@@ -119,6 +136,7 @@ impl ObjsetPhys {
     }
 }
 
+/// The type of the ObjectSet
 #[derive(Debug, Clone, TryFrom, PartialEq, Eq)]
 #[repr(u64)]
 pub enum OsType {
