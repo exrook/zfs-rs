@@ -1,5 +1,5 @@
 [workspace]
-members = ["zfsbrowser", "zfs-rs", "zfs-cli"]
+members = ["zfs-rs", "zfs-cli"]
 
 [patch.crates-io]
 crc = { git = "https://github.com/mrhooray/crc-rs" }
